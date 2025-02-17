@@ -31,6 +31,7 @@ class TransferStats:
         self.last_transferred = resumed_size
         self.current_speed = 0
         self.retries = 0
+        self.cancelled = False
         
     def increment_retries(self):
         self.retries += 1
@@ -111,7 +112,7 @@ class TransferRecord:
             del self.records[key]
             self.save_records()
 
-def send_file(target_ip, target_port, path, target_dir, progress_callback=None):
+def send_file(target_ip, target_port, path, target_dir, progress_callback=None, transfer_stats=None):
     """Send a file or directory to the target computer"""
     transfer_record = TransferRecord()
     client_socket = None
@@ -131,9 +132,16 @@ def send_file(target_ip, target_port, path, target_dir, progress_callback=None):
                     files_to_send.append((abs_path, rel_path))
         
         total_size = sum(os.path.getsize(f[0]) for f in files_to_send)
-        stats = TransferStats(total_size)
+        if transfer_stats is None:
+            transfer_stats = TransferStats(total_size)
+        else:
+            transfer_stats.total_size = total_size
         
         for file_path, rel_path in files_to_send:
+            if transfer_stats.cancelled:
+                print("Transfer cancelled by user")
+                return
+                
             size = os.path.getsize(file_path)
             remote_path = os.path.join(target_dir, rel_path).replace('\\', '/')
             
@@ -141,13 +149,17 @@ def send_file(target_ip, target_port, path, target_dir, progress_callback=None):
             resume_position = transfer_record.get_transfer_progress(target_ip, target_dir, file_path)
             if resume_position >= size:
                 print(f"File already transferred: {rel_path}")
-                stats.transferred += size
+                transfer_stats.transferred += size
                 if progress_callback:
-                    progress_callback(stats)
+                    progress_callback(transfer_stats)
                 continue
             
             # Attempt to connect with retries
             for attempt in range(MAX_RETRIES):
+                if transfer_stats.cancelled:
+                    print("Transfer cancelled by user")
+                    return
+                    
                 try:
                     if client_socket:
                         client_socket.close()
@@ -155,8 +167,8 @@ def send_file(target_ip, target_port, path, target_dir, progress_callback=None):
                     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     client_socket.connect((target_ip, target_port))
                     
-                    # Send file info with resume position
-                    file_info = f"{rel_path}|{size}|{resume_position}"
+                    # Send file info with resume position and target directory
+                    file_info = f"{rel_path}|{size}|{resume_position}|{target_dir}"
                     client_socket.sendall(file_info.encode())
                     
                     # Wait for acknowledgment
@@ -170,12 +182,16 @@ def send_file(target_ip, target_port, path, target_dir, progress_callback=None):
                         bytes_sent = resume_position
                         
                         while bytes_sent < size:
+                            if transfer_stats.cancelled:
+                                print("Transfer cancelled by user")
+                                return
+                                
                             chunk = f.read(CHUNK_SIZE)
                             if not chunk:
                                 break
                             client_socket.send(chunk)
                             bytes_sent += len(chunk)
-                            stats.transferred += len(chunk)
+                            transfer_stats.transferred += len(chunk)
                             
                             # Update transfer record periodically
                             if bytes_sent % (CHUNK_SIZE * 100) == 0:  # Every ~800KB
@@ -183,7 +199,7 @@ def send_file(target_ip, target_port, path, target_dir, progress_callback=None):
                                     target_ip, target_dir, file_path, bytes_sent)
                             
                             if progress_callback:
-                                progress_callback(stats)
+                                progress_callback(transfer_stats)
                                 
                     # Clear transfer record on successful completion
                     transfer_record.clear_transfer_record(target_ip, target_dir, file_path)
@@ -192,17 +208,18 @@ def send_file(target_ip, target_port, path, target_dir, progress_callback=None):
                     
                 except Exception as e:
                     print(f"Error sending file (attempt {attempt + 1}): {e}")
-                    stats.increment_retries()
+                    transfer_stats.increment_retries()
                     if progress_callback:
-                        progress_callback(stats)
-                    if attempt < MAX_RETRIES - 1:
+                        progress_callback(transfer_stats)
+                    if attempt < MAX_RETRIES - 1 and not transfer_stats.cancelled:
                         time.sleep(RETRY_DELAY)
                     else:
                         raise
                         
     except Exception as e:
-        print(f"Error during transfer: {e}")
-        raise
+        if not transfer_stats.cancelled:  # Don't show error if cancelled
+            print(f"Error during transfer: {e}")
+            raise
     finally:
         if client_socket:
             client_socket.close()
@@ -251,36 +268,49 @@ class FileTransferServer(threading.Thread):
             with client_socket:
                 # Receive the file info
                 file_info = client_socket.recv(1024).decode()
-                rel_path, size, resume_position = file_info.split('|')
+                rel_path, size, resume_position, dest_dir = file_info.split('|')
                 size = int(size)
                 resume_position = int(resume_position)
                 
                 # Send acknowledgment
                 client_socket.sendall(b"OK")
                 
-                # Create the downloads directory if it doesn't exist
-                downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-                os.makedirs(downloads_dir, exist_ok=True)
+                # Create the destination directory structure
+                file_dir = os.path.dirname(os.path.join(dest_dir, rel_path))
+                os.makedirs(file_dir, exist_ok=True)
                 
                 # Prepare the file path
-                file_path = os.path.join(downloads_dir, os.path.basename(rel_path))
+                file_path = os.path.join(dest_dir, rel_path)
                 
-                # Receive the file
-                with open(file_path, 'wb') as f:
-                    received = 0
+                # Open file in append mode if resuming, otherwise write mode
+                mode = 'ab' if resume_position > 0 else 'wb'
+                with open(file_path, mode) as f:
                     if resume_position > 0:
-                        f.seek(resume_position)
+                        # Verify file size matches resume position
+                        if os.path.getsize(file_path) != resume_position:
+                            print(f"Warning: File size mismatch during resume for {rel_path}")
+                            f.seek(0, 2)  # Seek to end of file
+                    
+                    received = resume_position
                     while received < size:
                         data = client_socket.recv(CHUNK_SIZE)
                         if not data:
                             break
                         f.write(data)
                         received += len(data)
-                        
-                print(f"File {rel_path} received successfully")
+                        if received % (CHUNK_SIZE * 100) == 0:  # Log progress every ~800KB
+                            print(f"Receiving {rel_path}: {received}/{size} bytes ({(received/size)*100:.1f}%)")
+                
+                print(f"File {rel_path} received successfully in {file_path}")
                 
         except Exception as e:
             print(f"Error handling client {address}: {e}")
+            # Send error message back to client
+            try:
+                error_msg = f"ERROR: {str(e)}".encode()
+                client_socket.sendall(error_msg)
+            except:
+                pass
             
     def stop(self):
         """Stop the server"""
@@ -390,6 +420,11 @@ class FileTransferApp:
                                       command=self.transfer_file, **button_style)
         self.transfer_button.pack(side=tk.LEFT, padx=5)
         
+        self.stop_button = tk.Button(buttons_frame, text="Stop Transfer",
+                                  command=self.stop_transfer, **button_style,
+                                  state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=5)
+        
         # Progress Frame
         self.progress_frame = tk.Frame(transfer_frame, bg='#f0f0f0')
         self.progress_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -427,6 +462,7 @@ class FileTransferApp:
         self.status_label.pack(pady=5)
         
         self.selected_file = None
+        self.current_transfer = None  # Keep track of current transfer stats
         self.refresh_local_ip()
 
     def load_history(self):
@@ -627,7 +663,7 @@ class FileTransferApp:
         if not self.selected_file:
             messagebox.showerror("Error", "Please select a file or folder first.")
             return
-        
+            
         target_ip = self.ip_var.get()
         if not target_ip:
             messagebox.showerror("Error", "Please enter a target IP address.")
@@ -636,7 +672,7 @@ class FileTransferApp:
         try:
             target_port = int(self.port_entry.get())
         except ValueError:
-            messagebox.showerror("Error", "Invalid port number.")
+            messagebox.showerror("Error", "Please enter a valid port number.")
             return
             
         dest_dir = self.dest_var.get()
@@ -653,20 +689,47 @@ class FileTransferApp:
         self.status_label.config(text="Status: Starting transfer...")
         self.show_progress()
         
+        # Enable stop button and disable transfer button
+        self.stop_button.config(state=tk.NORMAL)
+        self.transfer_button.config(state=tk.DISABLED)
+        
+        # Create transfer stats object
+        self.current_transfer = TransferStats(0)  # Size will be set in send_file
+        
         # Start transfer in a separate thread
         def transfer_thread():
             try:
                 send_file(target_ip, target_port, self.selected_file, dest_dir,
-                         progress_callback=self.update_progress)
-                self.master.after(0, lambda: self.status_label.config(
-                    text="Status: Transfer completed successfully!"))
+                         progress_callback=self.update_progress,
+                         transfer_stats=self.current_transfer)
+                
+                if self.current_transfer.cancelled:
+                    self.master.after(0, lambda: self.status_label.config(
+                        text="Status: Transfer cancelled by user"))
+                else:
+                    self.master.after(0, lambda: self.status_label.config(
+                        text="Status: Transfer completed successfully!"))
             except Exception as e:
                 self.master.after(0, lambda: self.status_label.config(
                     text=f"Status: Transfer failed! {str(e)}"))
             finally:
-                self.master.after(2000, self.hide_progress)
+                self.master.after(0, self.transfer_completed)
         
         threading.Thread(target=transfer_thread, daemon=True).start()
+        
+    def stop_transfer(self):
+        """Stop the current transfer"""
+        if self.current_transfer:
+            self.current_transfer.cancelled = True
+            self.status_label.config(text="Status: Cancelling transfer...")
+            self.stop_button.config(state=tk.DISABLED)
+    
+    def transfer_completed(self):
+        """Called when transfer is completed, cancelled, or failed"""
+        self.current_transfer = None
+        self.stop_button.config(state=tk.DISABLED)
+        self.transfer_button.config(state=tk.NORMAL)
+        self.hide_progress()
         
     def on_closing(self):
         """Handle window closing event"""
