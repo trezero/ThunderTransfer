@@ -13,6 +13,7 @@ import humanize
 import paramiko
 import hashlib
 from pathlib import Path
+from cryptography.hazmat.primitives.ciphers import algorithms
 
 # Constants for the application
 APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".thundertransfer")
@@ -21,6 +22,65 @@ CREDENTIALS_FILE = os.path.join(APP_DATA_DIR, "credentials.json")
 CHUNK_SIZE = 8192  # 8KB chunks for transfer
 MAX_RETRIES = 10
 RETRY_DELAY = 2  # seconds between retries
+
+def check_and_install_thunderbolt_driver():
+    """
+    Checks if the Thunderbolt driver is installed.
+    If not found, guides the user to install it using Lenovo System Update.
+    Returns True if driver is found, False otherwise.
+    """
+    try:
+        # First check using driverquery
+        output = subprocess.check_output(["driverquery", "/FO", "CSV"], text=True)
+        
+        # Check for various Thunderbolt driver names
+        thunderbolt_drivers = [
+            "Thunderbolt(TM)",
+            "Intel(R) Thunderbolt(TM)",
+            "ThunderboltService",
+            "Thunderbolt Controller"
+        ]
+        
+        if any(driver in output for driver in thunderbolt_drivers):
+            print("Thunderbolt driver is installed.")
+            return True
+            
+        # Additional check using device manager
+        device_output = subprocess.check_output(["powershell", "Get-PnpDevice | Select-Object Status,Class,FriendlyName"], text=True)
+        if any(driver in device_output for driver in thunderbolt_drivers):
+            print("Thunderbolt driver found in device manager.")
+            return True
+            
+        print("Thunderbolt driver not found.")
+        messagebox.showinfo("Driver Installation Required", 
+            "Thunderbolt driver is not installed. Please install it using one of these methods:\n\n"
+            "1. Recommended: Use Lenovo System Update\n"
+            "   - Download from: support.lenovo.com/solutions/ht003029\n"
+            "   - Run System Update\n"
+            "   - Install 'Intel Thunderbolt Driver'\n\n"
+            "2. Manual Installation:\n"
+            "   - Visit support.lenovo.com\n"
+            "   - Enter your machine type\n"
+            "   - Go to Drivers & Software\n"
+            "   - Find and install 'Intel Thunderbolt Driver'\n\n"
+            "After installation, please restart this application."
+        )
+        return False
+        
+    except subprocess.CalledProcessError as e:
+        print(f"Error checking driver: {str(e)}")
+        messagebox.showerror("Error", 
+            "Unable to check Thunderbolt driver status.\n"
+            "Please ensure you have administrative privileges."
+        )
+        return False
+    except Exception as e:
+        print(f"Unexpected error checking driver: {str(e)}")
+        messagebox.showerror("Error", 
+            "An unexpected error occurred while checking the Thunderbolt driver.\n"
+            f"Error: {str(e)}"
+        )
+        return False
 
 class TransferStats:
     def __init__(self, total_size, resumed_size=0):
@@ -223,6 +283,82 @@ def send_file(target_ip, target_port, path, target_dir, progress_callback=None, 
     finally:
         if client_socket:
             client_socket.close()
+
+class FileTransferServer(threading.Thread):
+    """A server thread that listens for incoming file transfers"""
+    def __init__(self, port=5001):
+        super().__init__()
+        self.port = port
+        self._stop_event = threading.Event()
+        
+    def run(self):
+        """Start the server and listen for incoming connections"""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server_socket.bind(('0.0.0.0', self.port))
+                server_socket.listen(5)
+                server_socket.settimeout(1)  # 1 second timeout for checking stop event
+                
+                print(f"Server listening on port {self.port}")
+                
+                while not self._stop_event.is_set():
+                    try:
+                        client_socket, address = server_socket.accept()
+                        print(f"Connection from {address}")
+                        
+                        # Handle the connection in a new thread
+                        client_thread = threading.Thread(
+                            target=self.handle_client,
+                            args=(client_socket, address),
+                            daemon=True
+                        )
+                        client_thread.start()
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        print(f"Error accepting connection: {e}")
+                        
+        except Exception as e:
+            print(f"Server error: {e}")
+            
+    def handle_client(self, client_socket, address):
+        """Handle an incoming file transfer from a client"""
+        try:
+            with client_socket:
+                # Receive the file info
+                file_info = client_socket.recv(1024).decode()
+                file_name, file_size = file_info.split('|')
+                file_size = int(file_size)
+                
+                # Send acknowledgment
+                client_socket.sendall(b"OK")
+                
+                # Create the downloads directory if it doesn't exist
+                downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+                os.makedirs(downloads_dir, exist_ok=True)
+                
+                # Prepare the file path
+                file_path = os.path.join(downloads_dir, os.path.basename(file_name))
+                
+                # Receive the file
+                with open(file_path, 'wb') as f:
+                    received = 0
+                    while received < file_size:
+                        data = client_socket.recv(CHUNK_SIZE)
+                        if not data:
+                            break
+                        f.write(data)
+                        received += len(data)
+                        
+                print(f"File {file_name} received successfully")
+                
+        except Exception as e:
+            print(f"Error handling client {address}: {e}")
+            
+    def stop(self):
+        """Stop the server"""
+        self._stop_event.set()
 
 class FileTransferApp:
     def __init__(self, master):
