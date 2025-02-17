@@ -170,17 +170,33 @@ class FileTransferApp:
         self.master = master
         master.title("Thunderbolt File Transfer")
 
-        # Label and listbox for available computers
-        self.label = tk.Label(master, text="Available Computers:")
-        self.label.pack(pady=5)
+        # Frame for connection details
+        self.conn_frame = tk.Frame(master)
+        self.conn_frame.pack(pady=10, padx=10, fill=tk.X)
 
-        self.listbox = tk.Listbox(master, width=50)
-        self.listbox.pack(padx=10)
+        # IP Entry
+        self.ip_label = tk.Label(self.conn_frame, text="Target IP:")
+        self.ip_label.pack(side=tk.LEFT, padx=5)
+        self.ip_entry = tk.Entry(self.conn_frame)
+        self.ip_entry.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+        self.ip_entry.insert(0, "169.254.") # Default Thunderbolt network prefix
 
-        self.refresh_button = tk.Button(master, text="Refresh List", command=self.refresh_computers)
-        self.refresh_button.pack(pady=5)
+        # Port Entry
+        self.port_label = tk.Label(self.conn_frame, text="Port:")
+        self.port_label.pack(side=tk.LEFT, padx=5)
+        self.port_entry = tk.Entry(self.conn_frame, width=6)
+        self.port_entry.pack(side=tk.LEFT, padx=5)
+        self.port_entry.insert(0, "5001")
 
-        # Button to select file or folder (currently uses file dialog)
+        # Test Connection button
+        self.test_conn_button = tk.Button(self.conn_frame, text="Test Connection", command=self.test_connection)
+        self.test_conn_button.pack(side=tk.LEFT, padx=5)
+
+        # Status label
+        self.status_label = tk.Label(master, text="Status: Ready")
+        self.status_label.pack(pady=5)
+
+        # Button to select file or folder
         self.select_file_button = tk.Button(master, text="Select File/Folder", command=self.select_file)
         self.select_file_button.pack(pady=5)
 
@@ -189,57 +205,68 @@ class FileTransferApp:
         self.transfer_button.pack(pady=10)
 
         self.selected_file = None
-        self.refresh_computers()
 
-    def refresh_computers(self):
-        """Refresh the list of available computers using the 'net view' command."""
-        self.listbox.delete(0, tk.END)
+    def test_connection(self):
+        """Test the connection to the target computer."""
+        target_ip = self.ip_entry.get().strip()
+        target_port = int(self.port_entry.get().strip())
+
         try:
-            output = subprocess.check_output("net view", shell=True, text=True)
-            lines = output.splitlines()
-            for line in lines:
-                # Lines with computer names typically start with '\\'
-                if line.strip().startswith("\\\\"):
-                    comp = line.split()[0].strip("\\")
-                    self.listbox.insert(tk.END, comp)
+            # Try to create a test connection
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2)  # 2 second timeout
+                s.connect((target_ip, target_port))
+                self.status_label.config(text="Status: Connected successfully!", fg="green")
+                messagebox.showinfo("Success", f"Successfully connected to {target_ip}:{target_port}")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to retrieve computers: {e}")
+            self.status_label.config(text=f"Status: Connection failed - {str(e)}", fg="red")
+            messagebox.showerror("Connection Error", 
+                f"Could not connect to {target_ip}:{target_port}\n\n"
+                "Please check:\n"
+                "1. Target computer is running this application\n"
+                "2. Thunderbolt connection is established\n"
+                "3. IP address is correct (should start with 169.254.)\n"
+                "4. Port number matches the server")
 
     def select_file(self):
         """Opens a file dialog for the user to select a file to transfer."""
         file_path = filedialog.askopenfilename()
         if file_path:
             self.selected_file = file_path
-            messagebox.showinfo("File Selected", f"Selected file: {file_path}")
+            self.status_label.config(text=f"Status: Selected file: {os.path.basename(file_path)}")
 
     def transfer_file(self):
-        """Initiates the file transfer after ensuring a file and target are selected."""
+        """Initiates the file transfer after ensuring a file and connection details are valid."""
         if not self.selected_file:
             messagebox.showwarning("No File", "Please select a file first.")
             return
-        selection = self.listbox.curselection()
-        if not selection:
-            messagebox.showwarning("No Target", "Please select a target computer from the list.")
+
+        target_ip = self.ip_entry.get().strip()
+        if not target_ip:
+            messagebox.showwarning("No IP", "Please enter the target IP address.")
             return
 
-        target_computer = self.listbox.get(selection[0])
         try:
-            # Resolve the computer name to an IP address.
-            target_ip = socket.gethostbyname(target_computer)
-        except Exception as e:
-            messagebox.showerror("Error", f"Cannot resolve computer name: {e}")
+            target_port = int(self.port_entry.get().strip())
+        except ValueError:
+            messagebox.showwarning("Invalid Port", "Please enter a valid port number.")
             return
 
-        # Ask the user for the destination folder on the target computer.
-        target_dir = simpledialog.askstring("Target Directory", f"Enter destination directory on {target_computer}:")
+        # Ask the user for the destination folder on the target computer
+        target_dir = simpledialog.askstring("Target Directory", 
+            "Enter destination directory on target computer:\n"
+            "(e.g., C:\\Users\\username\\Downloads)")
         if not target_dir:
             messagebox.showwarning("No Directory", "Destination directory is required.")
             return
 
         try:
-            send_file(target_ip, 5001, self.selected_file, target_dir)
+            self.status_label.config(text="Status: Transferring file...", fg="blue")
+            send_file(target_ip, target_port, self.selected_file, target_dir)
+            self.status_label.config(text="Status: File transferred successfully!", fg="green")
             messagebox.showinfo("Success", "File transferred successfully!")
         except Exception as e:
+            self.status_label.config(text=f"Status: Transfer failed - {str(e)}", fg="red")
             messagebox.showerror("Error", f"File transfer failed: {e}")
 
 # =============================================================================
