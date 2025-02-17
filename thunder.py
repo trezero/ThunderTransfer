@@ -12,6 +12,7 @@ import time
 import humanize
 import hashlib
 from pathlib import Path
+from datetime import timedelta
 
 # Constants for the application
 APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".thundertransfer")
@@ -23,7 +24,7 @@ RETRY_DELAY = 2  # seconds between retries
 
 class TransferStats:
     def __init__(self, total_size, resumed_size=0):
-        self.total_size = total_size
+        self.total_size = max(total_size, 1)  # Prevent division by zero
         self.transferred = resumed_size
         self.start_time = time.time()
         self.last_update = self.start_time
@@ -33,7 +34,7 @@ class TransferStats:
         
     def increment_retries(self):
         self.retries += 1
-        return self.retries <= MAX_RETRIES
+        return self.retries < MAX_RETRIES
         
     def reset_speed(self):
         self.last_update = time.time()
@@ -588,17 +589,35 @@ class FileTransferApp:
         
     def update_progress(self, stats):
         """Update progress bar and labels with transfer statistics"""
-        progress = stats.transferred / stats.total_size * 100
+        if stats.total_size > 0:
+            progress = (stats.transferred / stats.total_size) * 100
+        else:
+            progress = 0
         self.progress_var.set(progress)
         
         # Update progress text
+        transferred_str = humanize.naturalsize(stats.transferred)
+        total_str = humanize.naturalsize(stats.total_size)
         self.progress_label.config(
-            text=f"{progress:.1f}% ({stats.transferred / stats.total_size * 100:.1f}%)")
+            text=f"{progress:.1f}% ({transferred_str} / {total_str})")
         
         # Update speed and ETA
+        elapsed = time.time() - stats.last_update
+        if elapsed > 0:
+            speed = (stats.transferred - stats.last_transferred) / elapsed / 1024  # KB/s
+        else:
+            speed = 0
+            
+        remaining = stats.total_size - stats.transferred
+        if speed > 0:
+            eta_seconds = remaining / (speed * 1024)
+            eta_str = humanize.naturaltime(datetime.now() + timedelta(seconds=eta_seconds))
+        else:
+            eta_str = "calculating..."
+            
         retry_text = f" - Retry {stats.retries}/{MAX_RETRIES}" if stats.retries > 0 else ""
         self.speed_label.config(
-            text=f"{stats.transferred / (time.time() - stats.start_time) / 1024:.1f} KB/s - {stats.transferred / stats.total_size * 100:.1f}%{retry_text}")
+            text=f"{speed:.1f} KB/s - ETA: {eta_str}{retry_text}")
         
         # Update the window to ensure progress is shown
         self.master.update()
