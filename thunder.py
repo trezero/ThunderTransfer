@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.ciphers import algorithms
 APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".thundertransfer")
 HISTORY_FILE = os.path.join(APP_DATA_DIR, "transfer_history.json")
 CREDENTIALS_FILE = os.path.join(APP_DATA_DIR, "credentials.json")
+TRANSFERS_FILE = os.path.join(APP_DATA_DIR, "transfers.json")
 CHUNK_SIZE = 8192  # 8KB chunks for transfer
 MAX_RETRIES = 10
 RETRY_DELAY = 2  # seconds between retries
@@ -170,130 +171,178 @@ class SSHManager:
             except:
                 pass
 
-def send_file(target_ip, target_port, path, target_dir, progress_callback=None, ssh_manager=None):
-    stats = None
-    client_socket = None
-    
-    try:
-        # Prepare file list and check existing files
-        items = []
-        files_to_send = []
-        total_size = 0
-        resumed_size = 0
+class TransferRecord:
+    """Class to manage transfer records and resumption"""
+    def __init__(self):
+        self.records = self.load_records()
         
+    def load_records(self):
+        """Load transfer records from file"""
+        try:
+            if os.path.exists(TRANSFERS_FILE):
+                with open(TRANSFERS_FILE, 'r') as f:
+                    return json.load(f)
+            return {}
+        except Exception as e:
+            print(f"Error loading transfer records: {e}")
+            return {}
+            
+    def save_records(self):
+        """Save transfer records to file"""
+        try:
+            os.makedirs(os.path.dirname(TRANSFERS_FILE), exist_ok=True)
+            with open(TRANSFERS_FILE, 'w') as f:
+                json.dump(self.records, f)
+        except Exception as e:
+            print(f"Error saving transfer records: {e}")
+            
+    def get_record_key(self, target_ip, target_dir, file_path):
+        """Generate a unique key for a transfer record"""
+        file_hash = self.get_file_hash(file_path)
+        return f"{target_ip}:{target_dir}:{file_hash}"
+        
+    def get_file_hash(self, file_path):
+        """Calculate SHA-256 hash of first and last 1MB of file for quick comparison"""
+        try:
+            sha256 = hashlib.sha256()
+            with open(file_path, 'rb') as f:
+                # Read first 1MB
+                start_chunk = f.read(1024 * 1024)
+                sha256.update(start_chunk)
+                
+                # Read last 1MB
+                f.seek(-min(1024 * 1024, os.path.getsize(file_path)), 2)
+                end_chunk = f.read()
+                sha256.update(end_chunk)
+                
+            return sha256.hexdigest()
+        except Exception as e:
+            print(f"Error calculating file hash: {e}")
+            return None
+            
+    def get_transfer_progress(self, target_ip, target_dir, file_path):
+        """Get the progress of a previous transfer"""
+        key = self.get_record_key(target_ip, target_dir, file_path)
+        return self.records.get(key, {}).get('bytes_transferred', 0)
+        
+    def update_transfer_progress(self, target_ip, target_dir, file_path, bytes_transferred):
+        """Update the progress of a transfer"""
+        key = self.get_record_key(target_ip, target_dir, file_path)
+        self.records[key] = {
+            'bytes_transferred': bytes_transferred,
+            'last_updated': time.time(),
+            'file_size': os.path.getsize(file_path)
+        }
+        self.save_records()
+        
+    def clear_transfer_record(self, target_ip, target_dir, file_path):
+        """Clear the record of a completed transfer"""
+        key = self.get_record_key(target_ip, target_dir, file_path)
+        if key in self.records:
+            del self.records[key]
+            self.save_records()
+
+def send_file(target_ip, target_port, path, target_dir, progress_callback=None, ssh_manager=None):
+    """Send a file or directory to the target computer"""
+    transfer_record = TransferRecord()
+    client_socket = None
+    try:
+        # Get the base directory for relative paths
+        base_dir = os.path.dirname(path) if os.path.isfile(path) else path
+        files_to_send = []
+        
+        # Collect all files to send
         if os.path.isfile(path):
-            size = os.path.getsize(path)
-            total_size = size
-            rel_path = os.path.basename(path)
+            files_to_send.append((path, os.path.basename(path)))
+        else:
+            for root, _, files in os.walk(path):
+                for file in files:
+                    abs_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(abs_path, base_dir)
+                    files_to_send.append((abs_path, rel_path))
+        
+        total_size = sum(os.path.getsize(f[0]) for f in files_to_send)
+        stats = TransferStats(total_size)
+        
+        for file_path, rel_path in files_to_send:
+            size = os.path.getsize(file_path)
             remote_path = os.path.join(target_dir, rel_path).replace('\\', '/')
             
+            # Check for existing progress
+            resume_position = 0
             if ssh_manager:
-                existing_size = ssh_manager.check_remote_file(target_ip, remote_path, ssh_manager.get_credentials(target_ip)['username'], ssh_manager.get_credentials(target_ip)['password'])
-                if existing_size is not None and existing_size > 0:
-                    if existing_size == size:
-                        # File already exists and is complete
-                        return
-                    resumed_size = existing_size
+                existing_size = ssh_manager.check_remote_file(target_ip, remote_path, 
+                    ssh_manager.get_credentials(target_ip)['username'], 
+                    ssh_manager.get_credentials(target_ip)['password'])
+                if existing_size is not None:
+                    resume_position = existing_size
+            else:
+                # Check local transfer record
+                resume_position = transfer_record.get_transfer_progress(target_ip, target_dir, file_path)
+                if resume_position >= size:
+                    print(f"File already transferred: {rel_path}")
+                    stats.transferred += size
+                    if progress_callback:
+                        progress_callback(stats)
+                    continue
             
-            items.append({
-                "rel_path": rel_path,
-                "size": size,
-                "is_dir": False,
-                "resume_position": resumed_size
-            })
-            files_to_send.append((path, rel_path, size, resumed_size))
-        else:
-            base_path = os.path.dirname(path)
-            for root, dirs, files in os.walk(path):
-                for dir_name in dirs:
-                    full_dir_path = os.path.join(root, dir_name)
-                    rel_path = os.path.relpath(full_dir_path, base_path)
-                    items.append({"rel_path": rel_path, "size": 0, "is_dir": True})
-                
-                for file_name in files:
-                    full_file_path = os.path.join(root, file_name)
-                    rel_path = os.path.relpath(full_file_path, base_path)
-                    size = os.path.getsize(full_file_path)
-                    remote_path = os.path.join(target_dir, rel_path).replace('\\', '/')
+            # Attempt to connect with retries
+            for attempt in range(MAX_RETRIES):
+                try:
+                    if client_socket:
+                        client_socket.close()
                     
-                    resume_position = 0
-                    if ssh_manager:
-                        existing_size = ssh_manager.check_remote_file(target_ip, remote_path, ssh_manager.get_credentials(target_ip)['username'], ssh_manager.get_credentials(target_ip)['password'])
-                        if existing_size is not None:
-                            if existing_size == size:
-                                continue  # Skip this file, it's already complete
-                            resume_position = existing_size
+                    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    client_socket.connect((target_ip, target_port))
                     
-                    total_size += size
-                    resumed_size += resume_position
-                    items.append({
-                        "rel_path": rel_path,
-                        "size": size,
-                        "is_dir": False,
-                        "resume_position": resume_position
-                    })
-                    files_to_send.append((full_file_path, rel_path, size, resume_position))
-
-        # Initialize transfer stats with resumed size
-        stats = TransferStats(total_size, resumed_size)
-        if progress_callback:
-            progress_callback(stats)
-
-        while True:
-            try:
-                # Connect to the server
-                client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                client_socket.connect((target_ip, target_port))
-
-                # Send header
-                header = {
-                    "target_dir": target_dir,
-                    "is_folder": os.path.isdir(path),
-                    "items": items
-                }
-                header_json = json.dumps(header)
-                header_bytes = header_json.encode()
-                
-                client_socket.send(len(header_bytes).to_bytes(4, byteorder='big'))
-                client_socket.send(header_bytes)
-
-                # Send all files
-                for full_path, rel_path, size, resume_position in files_to_send:
-                    with open(full_path, 'rb') as f:
-                        # Seek to resume position if needed
-                        if resume_position > 0:
-                            f.seek(resume_position)
-                            
-                        while True:
+                    # Send file info with resume position
+                    file_info = f"{rel_path}|{size}|{resume_position}"
+                    client_socket.sendall(file_info.encode())
+                    
+                    # Wait for acknowledgment
+                    response = client_socket.recv(1024).decode()
+                    if response != "OK":
+                        raise Exception(f"Server response: {response}")
+                    
+                    # Open file and seek to resume position
+                    with open(file_path, 'rb') as f:
+                        f.seek(resume_position)
+                        bytes_sent = resume_position
+                        
+                        while bytes_sent < size:
                             chunk = f.read(CHUNK_SIZE)
                             if not chunk:
                                 break
                             client_socket.send(chunk)
+                            bytes_sent += len(chunk)
                             stats.transferred += len(chunk)
+                            
+                            # Update transfer record periodically
+                            if bytes_sent % (CHUNK_SIZE * 100) == 0:  # Every ~800KB
+                                transfer_record.update_transfer_progress(
+                                    target_ip, target_dir, file_path, bytes_sent)
+                            
                             if progress_callback:
                                 progress_callback(stats)
+                                
+                    # Clear transfer record on successful completion
+                    transfer_record.clear_transfer_record(target_ip, target_dir, file_path)
                     print(f"Sent: {rel_path}")
-                
-                # If we get here, transfer was successful
-                break
-                
-            except socket.error as e:
-                if client_socket:
-                    client_socket.close()
-                    client_socket = None
-                
-                if not stats.increment_retries():
-                    raise Exception(f"Max retries ({MAX_RETRIES}) exceeded. Last error: {str(e)}")
-                
-                if progress_callback:
-                    progress_callback(stats)
-                
-                print(f"Connection error (attempt {stats.retries}/{MAX_RETRIES}): {e}")
-                time.sleep(RETRY_DELAY)
-                stats.reset_speed()
-
+                    break
+                    
+                except Exception as e:
+                    print(f"Error sending file (attempt {attempt + 1}): {e}")
+                    stats.increment_retries()
+                    if progress_callback:
+                        progress_callback(stats)
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_DELAY)
+                    else:
+                        raise
+                        
     except Exception as e:
-        raise Exception(f"Failed to send file: {str(e)}")
+        print(f"Error during transfer: {e}")
+        raise
     finally:
         if client_socket:
             client_socket.close()
@@ -342,8 +391,9 @@ class FileTransferServer(threading.Thread):
             with client_socket:
                 # Receive the file info
                 file_info = client_socket.recv(1024).decode()
-                file_name, file_size = file_info.split('|')
-                file_size = int(file_size)
+                rel_path, size, resume_position = file_info.split('|')
+                size = int(size)
+                resume_position = int(resume_position)
                 
                 # Send acknowledgment
                 client_socket.sendall(b"OK")
@@ -353,19 +403,21 @@ class FileTransferServer(threading.Thread):
                 os.makedirs(downloads_dir, exist_ok=True)
                 
                 # Prepare the file path
-                file_path = os.path.join(downloads_dir, os.path.basename(file_name))
+                file_path = os.path.join(downloads_dir, os.path.basename(rel_path))
                 
                 # Receive the file
                 with open(file_path, 'wb') as f:
                     received = 0
-                    while received < file_size:
+                    if resume_position > 0:
+                        f.seek(resume_position)
+                    while received < size:
                         data = client_socket.recv(CHUNK_SIZE)
                         if not data:
                             break
                         f.write(data)
                         received += len(data)
                         
-                print(f"File {file_name} received successfully")
+                print(f"File {rel_path} received successfully")
                 
         except Exception as e:
             print(f"Error handling client {address}: {e}")
