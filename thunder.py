@@ -105,41 +105,55 @@ class SSHManager:
         self.credentials = self.load_credentials()
         
     def load_credentials(self):
+        """Load saved SSH credentials from file"""
         try:
             if os.path.exists(CREDENTIALS_FILE):
                 with open(CREDENTIALS_FILE, 'r') as f:
                     return json.load(f)
             return {}
-        except Exception:
+        except Exception as e:
+            print(f"Error loading credentials: {e}")
             return {}
             
     def save_credentials(self):
+        """Save SSH credentials to file"""
         try:
-            os.makedirs(APP_DATA_DIR, exist_ok=True)
+            os.makedirs(os.path.dirname(CREDENTIALS_FILE), exist_ok=True)
             with open(CREDENTIALS_FILE, 'w') as f:
                 json.dump(self.credentials, f)
         except Exception as e:
             print(f"Error saving credentials: {e}")
             
-    def get_credentials(self, host):
-        return self.credentials.get(host, {})
+    def get_credentials(self, host, destination=None):
+        """Get credentials for a specific host and destination"""
+        key = f"{host}:{destination}" if destination else host
+        return self.credentials.get(key, {})
         
-    def set_credentials(self, host, username, password):
-        self.credentials[host] = {
-            "username": username,
-            "password": password
+    def set_credentials(self, host, username, password, destination=None):
+        """Save credentials for a specific host and destination"""
+        key = f"{host}:{destination}" if destination else host
+        self.credentials[key] = {
+            'username': username,
+            'password': password
         }
         self.save_credentials()
         
-    def check_remote_file(self, host, remote_path):
-        creds = self.get_credentials(host)
-        if not creds:
-            return None
-            
+    def test_connection(self, host, username, password):
+        """Test SSH connection with given credentials"""
         try:
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(host, username=creds["username"], password=creds["password"])
+            ssh.connect(host, username=username, password=password, timeout=5)
+            ssh.close()
+            return True, "SSH connection successful!"
+        except Exception as e:
+            return False, f"SSH connection failed: {str(e)}"
+        
+    def check_remote_file(self, host, remote_path, username, password):
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(host, username=username, password=password)
             
             sftp = ssh.open_sftp()
             try:
@@ -174,7 +188,7 @@ def send_file(target_ip, target_port, path, target_dir, progress_callback=None, 
             remote_path = os.path.join(target_dir, rel_path).replace('\\', '/')
             
             if ssh_manager:
-                existing_size = ssh_manager.check_remote_file(target_ip, remote_path)
+                existing_size = ssh_manager.check_remote_file(target_ip, remote_path, ssh_manager.get_credentials(target_ip)['username'], ssh_manager.get_credentials(target_ip)['password'])
                 if existing_size is not None and existing_size > 0:
                     if existing_size == size:
                         # File already exists and is complete
@@ -204,7 +218,7 @@ def send_file(target_ip, target_port, path, target_dir, progress_callback=None, 
                     
                     resume_position = 0
                     if ssh_manager:
-                        existing_size = ssh_manager.check_remote_file(target_ip, remote_path)
+                        existing_size = ssh_manager.check_remote_file(target_ip, remote_path, ssh_manager.get_credentials(target_ip)['username'], ssh_manager.get_credentials(target_ip)['password'])
                         if existing_size is not None:
                             if existing_size == size:
                                 continue  # Skip this file, it's already complete
@@ -255,7 +269,7 @@ def send_file(target_ip, target_port, path, target_dir, progress_callback=None, 
                             if not chunk:
                                 break
                             client_socket.send(chunk)
-                            stats.update(len(chunk))
+                            stats.transferred += len(chunk)
                             if progress_callback:
                                 progress_callback(stats)
                     print(f"Sent: {rel_path}")
@@ -523,6 +537,11 @@ class FileTransferApp:
                       variable=self.save_credentials_var,
                       bg='#f0f0f0').pack(side=tk.LEFT, padx=10)
         
+        # Add Test SSH button
+        tk.Button(ssh_inner_frame, text="Test SSH", 
+                 command=self.test_ssh_connection,
+                 **button_style).pack(side=tk.LEFT, padx=5)
+        
         # Load saved credentials if available
         self.load_ssh_credentials()
         
@@ -690,31 +709,32 @@ class FileTransferApp:
         
     def update_progress(self, stats):
         """Update progress bar and labels with transfer statistics"""
-        progress = stats.get_progress() * 100
+        progress = stats.transferred / stats.total_size * 100
         self.progress_var.set(progress)
         
         # Update progress text
         self.progress_label.config(
-            text=f"{progress:.1f}% ({stats.get_progress_str()})")
+            text=f"{progress:.1f}% ({stats.transferred / stats.total_size * 100:.1f}%)")
         
         # Update speed and ETA
         retry_text = f" - Retry {stats.retries}/{MAX_RETRIES}" if stats.retries > 0 else ""
         self.speed_label.config(
-            text=f"{stats.get_speed_str()} - {stats.get_eta_str()}{retry_text}")
+            text=f"{stats.transferred / (time.time() - stats.start_time) / 1024:.1f} KB/s - {stats.transferred / stats.total_size * 100:.1f}%{retry_text}")
         
         # Update the window to ensure progress is shown
         self.master.update()
 
     def load_ssh_credentials(self):
-        """Load saved SSH credentials for the current IP"""
-        ip = self.ip_var.get()
-        if ip:
-            creds = self.ssh_manager.get_credentials(ip)
+        """Load saved SSH credentials for current IP and destination"""
+        target_ip = self.ip_var.get()
+        destination = self.dest_var.get()
+        if target_ip:
+            creds = self.ssh_manager.get_credentials(target_ip, destination)
             if creds:
                 self.ssh_username.delete(0, tk.END)
-                self.ssh_username.insert(0, creds.get("username", ""))
+                self.ssh_username.insert(0, creds.get('username', ''))
                 self.ssh_password.delete(0, tk.END)
-                self.ssh_password.insert(0, creds.get("password", ""))
+                self.ssh_password.insert(0, creds.get('password', ''))
 
     def save_ssh_credentials(self):
         """Save current SSH credentials"""
@@ -724,7 +744,8 @@ class FileTransferApp:
                 self.ssh_manager.set_credentials(
                     ip,
                     self.ssh_username.get(),
-                    self.ssh_password.get()
+                    self.ssh_password.get(),
+                    self.dest_var.get()
                 )
 
     def transfer_file(self):
@@ -783,6 +804,36 @@ class FileTransferApp:
             self.status_label.config(text="Status: Transfer failed!")
             self.hide_progress()
 
+    def test_ssh_connection(self):
+        """Test SSH connection with current credentials"""
+        target_ip = self.ip_var.get()
+        if not target_ip:
+            messagebox.showerror("Error", "Please enter a target IP address")
+            return
+            
+        username = self.ssh_username.get()
+        password = self.ssh_password.get()
+        
+        if not username or not password:
+            messagebox.showerror("Error", "Please enter both username and password")
+            return
+            
+        self.status_label.config(text="Status: Testing SSH connection...")
+        success, message = self.ssh_manager.test_connection(target_ip, username, password)
+        
+        if success:
+            messagebox.showinfo("Success", message)
+            self.status_label.config(text="Status: SSH connection successful")
+            
+            # Save credentials if checkbox is checked
+            if self.save_credentials_var.get():
+                destination = self.dest_var.get()
+                self.ssh_manager.set_credentials(target_ip, username, password, destination)
+                print(f"Credentials saved for {target_ip} and destination {destination}")
+        else:
+            messagebox.showerror("Error", message)
+            self.status_label.config(text="Status: SSH connection failed")
+            
     def on_closing(self):
         """Handle window closing event"""
         if hasattr(self, 'server') and self.server:
