@@ -10,78 +10,16 @@ import sys
 from datetime import datetime
 import time
 import humanize
-import paramiko
 import hashlib
 from pathlib import Path
-from cryptography.hazmat.primitives.ciphers import algorithms
 
 # Constants for the application
 APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".thundertransfer")
 HISTORY_FILE = os.path.join(APP_DATA_DIR, "transfer_history.json")
-CREDENTIALS_FILE = os.path.join(APP_DATA_DIR, "credentials.json")
 TRANSFERS_FILE = os.path.join(APP_DATA_DIR, "transfers.json")
 CHUNK_SIZE = 8192  # 8KB chunks for transfer
 MAX_RETRIES = 10
 RETRY_DELAY = 2  # seconds between retries
-
-def check_and_install_thunderbolt_driver():
-    """
-    Checks if the Thunderbolt driver is installed.
-    If not found, guides the user to install it using Lenovo System Update.
-    Returns True if driver is found, False otherwise.
-    """
-    try:
-        # First check using driverquery
-        output = subprocess.check_output(["driverquery", "/FO", "CSV"], text=True)
-        
-        # Check for various Thunderbolt driver names
-        thunderbolt_drivers = [
-            "Thunderbolt(TM)",
-            "Intel(R) Thunderbolt(TM)",
-            "ThunderboltService",
-            "Thunderbolt Controller"
-        ]
-        
-        if any(driver in output for driver in thunderbolt_drivers):
-            print("Thunderbolt driver is installed.")
-            return True
-            
-        # Additional check using device manager
-        device_output = subprocess.check_output(["powershell", "Get-PnpDevice | Select-Object Status,Class,FriendlyName"], text=True)
-        if any(driver in device_output for driver in thunderbolt_drivers):
-            print("Thunderbolt driver found in device manager.")
-            return True
-            
-        print("Thunderbolt driver not found.")
-        messagebox.showinfo("Driver Installation Required", 
-            "Thunderbolt driver is not installed. Please install it using one of these methods:\n\n"
-            "1. Recommended: Use Lenovo System Update\n"
-            "   - Download from: support.lenovo.com/solutions/ht003029\n"
-            "   - Run System Update\n"
-            "   - Install 'Intel Thunderbolt Driver'\n\n"
-            "2. Manual Installation:\n"
-            "   - Visit support.lenovo.com\n"
-            "   - Enter your machine type\n"
-            "   - Go to Drivers & Software\n"
-            "   - Find and install 'Intel Thunderbolt Driver'\n\n"
-            "After installation, please restart this application."
-        )
-        return False
-        
-    except subprocess.CalledProcessError as e:
-        print(f"Error checking driver: {str(e)}")
-        messagebox.showerror("Error", 
-            "Unable to check Thunderbolt driver status.\n"
-            "Please ensure you have administrative privileges."
-        )
-        return False
-    except Exception as e:
-        print(f"Unexpected error checking driver: {str(e)}")
-        messagebox.showerror("Error", 
-            "An unexpected error occurred while checking the Thunderbolt driver.\n"
-            f"Error: {str(e)}"
-        )
-        return False
 
 class TransferStats:
     def __init__(self, total_size, resumed_size=0):
@@ -100,76 +38,6 @@ class TransferStats:
     def reset_speed(self):
         self.last_update = time.time()
         self.last_transferred = self.transferred
-
-class SSHManager:
-    def __init__(self):
-        self.credentials = self.load_credentials()
-        
-    def load_credentials(self):
-        """Load saved SSH credentials from file"""
-        try:
-            if os.path.exists(CREDENTIALS_FILE):
-                with open(CREDENTIALS_FILE, 'r') as f:
-                    return json.load(f)
-            return {}
-        except Exception as e:
-            print(f"Error loading credentials: {e}")
-            return {}
-            
-    def save_credentials(self):
-        """Save SSH credentials to file"""
-        try:
-            os.makedirs(os.path.dirname(CREDENTIALS_FILE), exist_ok=True)
-            with open(CREDENTIALS_FILE, 'w') as f:
-                json.dump(self.credentials, f)
-        except Exception as e:
-            print(f"Error saving credentials: {e}")
-            
-    def get_credentials(self, host, destination=None):
-        """Get credentials for a specific host and destination"""
-        key = f"{host}:{destination}" if destination else host
-        return self.credentials.get(key, {})
-        
-    def set_credentials(self, host, username, password, destination=None):
-        """Save credentials for a specific host and destination"""
-        key = f"{host}:{destination}" if destination else host
-        self.credentials[key] = {
-            'username': username,
-            'password': password
-        }
-        self.save_credentials()
-        
-    def test_connection(self, host, username, password):
-        """Test SSH connection with given credentials"""
-        try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(host, username=username, password=password, timeout=5)
-            ssh.close()
-            return True, "SSH connection successful!"
-        except Exception as e:
-            return False, f"SSH connection failed: {str(e)}"
-        
-    def check_remote_file(self, host, remote_path, username, password):
-        try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(host, username=username, password=password)
-            
-            sftp = ssh.open_sftp()
-            try:
-                attrs = sftp.stat(remote_path)
-                return attrs.st_size
-            except FileNotFoundError:
-                return 0
-        except Exception as e:
-            print(f"SSH error: {e}")
-            return None
-        finally:
-            try:
-                ssh.close()
-            except:
-                pass
 
 class TransferRecord:
     """Class to manage transfer records and resumption"""
@@ -242,7 +110,7 @@ class TransferRecord:
             del self.records[key]
             self.save_records()
 
-def send_file(target_ip, target_port, path, target_dir, progress_callback=None, ssh_manager=None):
+def send_file(target_ip, target_port, path, target_dir, progress_callback=None):
     """Send a file or directory to the target computer"""
     transfer_record = TransferRecord()
     client_socket = None
@@ -268,23 +136,14 @@ def send_file(target_ip, target_port, path, target_dir, progress_callback=None, 
             size = os.path.getsize(file_path)
             remote_path = os.path.join(target_dir, rel_path).replace('\\', '/')
             
-            # Check for existing progress
-            resume_position = 0
-            if ssh_manager:
-                existing_size = ssh_manager.check_remote_file(target_ip, remote_path, 
-                    ssh_manager.get_credentials(target_ip)['username'], 
-                    ssh_manager.get_credentials(target_ip)['password'])
-                if existing_size is not None:
-                    resume_position = existing_size
-            else:
-                # Check local transfer record
-                resume_position = transfer_record.get_transfer_progress(target_ip, target_dir, file_path)
-                if resume_position >= size:
-                    print(f"File already transferred: {rel_path}")
-                    stats.transferred += size
-                    if progress_callback:
-                        progress_callback(stats)
-                    continue
+            # Check local transfer record
+            resume_position = transfer_record.get_transfer_progress(target_ip, target_dir, file_path)
+            if resume_position >= size:
+                print(f"File already transferred: {rel_path}")
+                stats.transferred += size
+                if progress_callback:
+                    progress_callback(stats)
+                continue
             
             # Attempt to connect with retries
             for attempt in range(MAX_RETRIES):
@@ -431,9 +290,6 @@ class FileTransferApp:
         self.master = master
         master.title("ThunderTransfer")
         
-        # Initialize SSH manager
-        self.ssh_manager = SSHManager()
-        
         # Configure window
         master.geometry("800x600")
         master.configure(bg='#f0f0f0')
@@ -457,11 +313,11 @@ class FileTransferApp:
         # Title
         title_label = tk.Label(main_container, text="ThunderTransfer", **title_style)
         title_label.pack(pady=(0, 20))
-
+        
         # Connection Frame
         conn_frame = tk.LabelFrame(main_container, text="Connection Settings", bg='#f0f0f0', fg='#333333')
         conn_frame.pack(fill=tk.X, pady=(0, 15))
-
+        
         # IP Frame
         ip_frame = tk.Frame(conn_frame, bg='#f0f0f0')
         ip_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -474,7 +330,7 @@ class FileTransferApp:
                  **button_style).pack(side=tk.LEFT, padx=5)
         tk.Button(ip_frame, text="Update IP", command=self.update_ip,
                  **button_style).pack(side=tk.LEFT, padx=5)
-
+        
         # Target IP Frame
         target_frame = tk.Frame(conn_frame, bg='#f0f0f0')
         target_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -496,11 +352,11 @@ class FileTransferApp:
         
         tk.Button(target_frame, text="Test Connection", command=self.test_connection,
                  **button_style).pack(side=tk.LEFT, padx=5)
-
+        
         # Transfer Frame
         transfer_frame = tk.LabelFrame(main_container, text="Transfer", bg='#f0f0f0', fg='#333333')
         transfer_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
-
+        
         # Destination frame
         dest_frame = tk.Frame(transfer_frame, bg='#f0f0f0')
         dest_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -515,24 +371,24 @@ class FileTransferApp:
         # Add new destination button
         tk.Button(dest_frame, text="New", command=self.add_destination,
                  **button_style).pack(side=tk.LEFT, padx=5)
-
+        
         # Selection info
         self.selection_label = tk.Label(transfer_frame, text="No file/folder selected", 
-                                      **label_style, wraplength=700)
+                                     **label_style, wraplength=700)
         self.selection_label.pack(pady=10, padx=10)
-
+        
         # Buttons frame
         buttons_frame = tk.Frame(transfer_frame, bg='#f0f0f0')
         buttons_frame.pack(pady=10)
         
         select_button = tk.Button(buttons_frame, text="Select File/Folder", 
-                                command=self.select_file, **button_style)
+                               command=self.select_file, **button_style)
         select_button.pack(side=tk.LEFT, padx=5)
         
         self.transfer_button = tk.Button(buttons_frame, text="Transfer", 
-                                       command=self.transfer_file, **button_style)
+                                      command=self.transfer_file, **button_style)
         self.transfer_button.pack(side=tk.LEFT, padx=5)
-
+        
         # Progress Frame
         self.progress_frame = tk.Frame(transfer_frame, bg='#f0f0f0')
         self.progress_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -540,8 +396,8 @@ class FileTransferApp:
         # Progress bar
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(self.progress_frame, 
-                                          variable=self.progress_var,
-                                          maximum=100)
+                                         variable=self.progress_var,
+                                         maximum=100)
         self.progress_bar.pack(fill=tk.X, pady=(5, 0))
         
         # Progress labels frame
@@ -550,16 +406,16 @@ class FileTransferApp:
         
         # Progress details (left side)
         self.progress_label = tk.Label(self.progress_labels_frame, 
-                                     text="", 
-                                     bg='#f0f0f0', 
-                                     font=('Helvetica', 9))
+                                    text="", 
+                                    bg='#f0f0f0', 
+                                    font=('Helvetica', 9))
         self.progress_label.pack(side=tk.LEFT)
         
         # Speed and ETA (right side)
         self.speed_label = tk.Label(self.progress_labels_frame, 
-                                  text="", 
-                                  bg='#f0f0f0', 
-                                  font=('Helvetica', 9))
+                                 text="", 
+                                 bg='#f0f0f0', 
+                                 font=('Helvetica', 9))
         self.speed_label.pack(side=tk.RIGHT)
         
         # Initially hide progress elements
@@ -568,34 +424,6 @@ class FileTransferApp:
         # Status
         self.status_label = tk.Label(main_container, text="Status: Ready", **label_style)
         self.status_label.pack(pady=5)
-
-        # SSH Credentials Frame
-        ssh_frame = tk.LabelFrame(main_container, text="SSH Credentials (Optional)", bg='#f0f0f0', fg='#333333')
-        ssh_frame.pack(fill=tk.X, pady=(0, 15))
-        
-        ssh_inner_frame = tk.Frame(ssh_frame, bg='#f0f0f0')
-        ssh_inner_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        tk.Label(ssh_inner_frame, text="Username:", **label_style).pack(side=tk.LEFT, padx=(0, 5))
-        self.ssh_username = tk.Entry(ssh_inner_frame, font=('Helvetica', 10))
-        self.ssh_username.pack(side=tk.LEFT, padx=5)
-        
-        tk.Label(ssh_inner_frame, text="Password:", **label_style).pack(side=tk.LEFT, padx=(10, 5))
-        self.ssh_password = tk.Entry(ssh_inner_frame, font=('Helvetica', 10), show='*')
-        self.ssh_password.pack(side=tk.LEFT, padx=5)
-        
-        self.save_credentials_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(ssh_inner_frame, text="Save Credentials", 
-                      variable=self.save_credentials_var,
-                      bg='#f0f0f0').pack(side=tk.LEFT, padx=10)
-        
-        # Add Test SSH button
-        tk.Button(ssh_inner_frame, text="Test SSH", 
-                 command=self.test_ssh_connection,
-                 **button_style).pack(side=tk.LEFT, padx=5)
-        
-        # Load saved credentials if available
-        self.load_ssh_credentials()
         
         self.selected_file = None
         self.refresh_local_ip()
@@ -645,7 +473,6 @@ class FileTransferApp:
     def on_ip_selected(self, event=None):
         """Handle IP selection change"""
         self.update_destinations()
-        self.load_ssh_credentials()
 
     def add_destination(self):
         """Add a new destination for the current IP"""
@@ -776,30 +603,6 @@ class FileTransferApp:
         # Update the window to ensure progress is shown
         self.master.update()
 
-    def load_ssh_credentials(self):
-        """Load saved SSH credentials for current IP and destination"""
-        target_ip = self.ip_var.get()
-        destination = self.dest_var.get()
-        if target_ip:
-            creds = self.ssh_manager.get_credentials(target_ip, destination)
-            if creds:
-                self.ssh_username.delete(0, tk.END)
-                self.ssh_username.insert(0, creds.get('username', ''))
-                self.ssh_password.delete(0, tk.END)
-                self.ssh_password.insert(0, creds.get('password', ''))
-
-    def save_ssh_credentials(self):
-        """Save current SSH credentials"""
-        if self.save_credentials_var.get():
-            ip = self.ip_var.get()
-            if ip:
-                self.ssh_manager.set_credentials(
-                    ip,
-                    self.ssh_username.get(),
-                    self.ssh_password.get(),
-                    self.dest_var.get()
-                )
-
     def transfer_file(self):
         """Initiates the file transfer after ensuring a file and connection details are valid."""
         if not self.selected_file:
@@ -822,70 +625,30 @@ class FileTransferApp:
             messagebox.showerror("Error", "Please select or enter a destination directory.")
             return
         
-        # Save SSH credentials if provided
-        self.save_ssh_credentials()
+        # Update history
+        if target_ip not in self.history:
+            self.history[target_ip] = []
+        self.update_destination_usage(target_ip, dest_dir)
         
-        try:
-            # Update history
-            if target_ip not in self.history:
-                self.history[target_ip] = []
-            self.update_destination_usage(target_ip, dest_dir)
-            
-            # Clear previous status and show progress
-            self.status_label.config(text="Status: Starting transfer...")
-            self.show_progress()
-            
-            # Start transfer in a separate thread
-            def transfer_thread():
-                try:
-                    send_file(target_ip, target_port, self.selected_file, dest_dir,
-                             progress_callback=self.update_progress,
-                             ssh_manager=self.ssh_manager)
-                    self.master.after(0, lambda: self.status_label.config(
-                        text="Status: Transfer completed successfully!"))
-                except Exception as e:
-                    self.master.after(0, lambda: self.status_label.config(
-                        text=f"Status: Transfer failed! {str(e)}"))
-                finally:
-                    self.master.after(2000, self.hide_progress)
-            
-            threading.Thread(target=transfer_thread, daemon=True).start()
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Transfer failed: {str(e)}")
-            self.status_label.config(text="Status: Transfer failed!")
-            self.hide_progress()
-
-    def test_ssh_connection(self):
-        """Test SSH connection with current credentials"""
-        target_ip = self.ip_var.get()
-        if not target_ip:
-            messagebox.showerror("Error", "Please enter a target IP address")
-            return
-            
-        username = self.ssh_username.get()
-        password = self.ssh_password.get()
+        # Clear previous status and show progress
+        self.status_label.config(text="Status: Starting transfer...")
+        self.show_progress()
         
-        if not username or not password:
-            messagebox.showerror("Error", "Please enter both username and password")
-            return
-            
-        self.status_label.config(text="Status: Testing SSH connection...")
-        success, message = self.ssh_manager.test_connection(target_ip, username, password)
+        # Start transfer in a separate thread
+        def transfer_thread():
+            try:
+                send_file(target_ip, target_port, self.selected_file, dest_dir,
+                         progress_callback=self.update_progress)
+                self.master.after(0, lambda: self.status_label.config(
+                    text="Status: Transfer completed successfully!"))
+            except Exception as e:
+                self.master.after(0, lambda: self.status_label.config(
+                    text=f"Status: Transfer failed! {str(e)}"))
+            finally:
+                self.master.after(2000, self.hide_progress)
         
-        if success:
-            messagebox.showinfo("Success", message)
-            self.status_label.config(text="Status: SSH connection successful")
-            
-            # Save credentials if checkbox is checked
-            if self.save_credentials_var.get():
-                destination = self.dest_var.get()
-                self.ssh_manager.set_credentials(target_ip, username, password, destination)
-                print(f"Credentials saved for {target_ip} and destination {destination}")
-        else:
-            messagebox.showerror("Error", message)
-            self.status_label.config(text="Status: SSH connection failed")
-            
+        threading.Thread(target=transfer_thread, daemon=True).start()
+        
     def on_closing(self):
         """Handle window closing event"""
         if hasattr(self, 'server') and self.server:
@@ -910,7 +673,31 @@ def get_thunderbolt_ip():
 
 if __name__ == "__main__":
     # Step 1: Check (and auto-install if needed) the Thunderbolt driver.
-    if not check_and_install_thunderbolt_driver():
+    try:
+        import subprocess
+        output = subprocess.check_output(["driverquery", "/FO", "CSV"], text=True)
+        thunderbolt_drivers = [
+            "Thunderbolt(TM)",
+            "Intel(R) Thunderbolt(TM)",
+            "ThunderboltService",
+            "Thunderbolt Controller"
+        ]
+        if not any(driver in output for driver in thunderbolt_drivers):
+            messagebox.showinfo("Driver Installation Required", 
+                "Thunderbolt driver is not installed. Please install it using one of these methods:\n\n"
+                "1. Recommended: Use Lenovo System Update\n"
+                "   - Download from: support.lenovo.com/solutions/ht003029\n"
+                "   - Run System Update\n"
+                "   - Install 'Intel Thunderbolt Driver'\n\n"
+                "2. Manual Installation:\n"
+                "   - Visit support.lenovo.com\n"
+                "   - Enter your machine type\n"
+                "   - Go to Drivers & Software\n"
+                "   - Find and install 'Intel Thunderbolt Driver'\n\n"
+                "After installation, please restart this application.")
+            sys.exit(1)
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to check Thunderbolt driver: {str(e)}")
         sys.exit(1)
         
     root = tk.Tk()
