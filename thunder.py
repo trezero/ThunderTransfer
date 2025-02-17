@@ -8,10 +8,55 @@ import tkinter as tk
 from tkinter import filedialog, simpledialog, messagebox, ttk
 import sys
 from datetime import datetime
+import time
+import humanize
 
 # Constants for the application
 APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".thundertransfer")
 HISTORY_FILE = os.path.join(APP_DATA_DIR, "transfer_history.json")
+CHUNK_SIZE = 8192  # 8KB chunks for transfer
+
+class TransferStats:
+    def __init__(self, total_size):
+        self.total_size = total_size
+        self.transferred = 0
+        self.start_time = time.time()
+        self.last_update = self.start_time
+        self.last_transferred = 0
+        self.current_speed = 0  # bytes per second
+        
+    def update(self, additional_bytes):
+        current_time = time.time()
+        self.transferred += additional_bytes
+        
+        # Update speed calculation every second
+        time_diff = current_time - self.last_update
+        if time_diff >= 1.0:
+            bytes_since_last = self.transferred - self.last_transferred
+            self.current_speed = bytes_since_last / time_diff
+            self.last_update = current_time
+            self.last_transferred = self.transferred
+            
+    def get_progress(self):
+        return (self.transferred / self.total_size) if self.total_size > 0 else 0
+        
+    def get_eta(self):
+        if self.current_speed > 0:
+            remaining_bytes = self.total_size - self.transferred
+            return remaining_bytes / self.current_speed
+        return 0
+        
+    def get_speed_str(self):
+        return humanize.naturalsize(self.current_speed, binary=True) + "/s"
+        
+    def get_progress_str(self):
+        return f"{humanize.naturalsize(self.transferred, binary=True)} / {humanize.naturalsize(self.total_size, binary=True)}"
+        
+    def get_eta_str(self):
+        eta = self.get_eta()
+        if eta <= 0:
+            return "calculating..."
+        return humanize.naturaltime(-eta, future=True)
 
 # =============================================================================
 # PART 1: Driver Check and Auto-Installation
@@ -119,7 +164,7 @@ class FileTransferServer(threading.Thread):
                 with open(full_path, 'wb') as f:
                     remaining = size
                     while remaining > 0:
-                        chunk_size = min(remaining, 8192)
+                        chunk_size = min(remaining, CHUNK_SIZE)
                         chunk = client_socket.recv(chunk_size)
                         if not chunk:
                             break
@@ -145,7 +190,7 @@ class FileTransferServer(threading.Thread):
 # =============================================================================
 # PART 3: File Transfer Client Function
 # =============================================================================
-def send_file(target_ip, target_port, path, target_dir):
+def send_file(target_ip, target_port, path, target_dir, progress_callback=None):
     try:
         # Connect to the server
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -154,11 +199,13 @@ def send_file(target_ip, target_port, path, target_dir):
         # Prepare the file list and metadata
         items = []
         files_to_send = []
+        total_size = 0
         
         if os.path.isfile(path):
             # Single file
-            rel_path = os.path.basename(path)
             size = os.path.getsize(path)
+            total_size = size
+            rel_path = os.path.basename(path)
             items.append({"rel_path": rel_path, "size": size, "is_dir": False})
             files_to_send.append((path, rel_path, size))
         else:
@@ -176,8 +223,14 @@ def send_file(target_ip, target_port, path, target_dir):
                     full_file_path = os.path.join(root, file_name)
                     rel_path = os.path.relpath(full_file_path, base_path)
                     size = os.path.getsize(full_file_path)
+                    total_size += size
                     items.append({"rel_path": rel_path, "size": size, "is_dir": False})
                     files_to_send.append((full_file_path, rel_path, size))
+
+        # Initialize transfer stats
+        stats = TransferStats(total_size)
+        if progress_callback:
+            progress_callback(stats)
 
         # Prepare and send header
         header = {
@@ -197,10 +250,13 @@ def send_file(target_ip, target_port, path, target_dir):
         for full_path, rel_path, size in files_to_send:
             with open(full_path, 'rb') as f:
                 while True:
-                    chunk = f.read(8192)
+                    chunk = f.read(CHUNK_SIZE)
                     if not chunk:
                         break
                     client_socket.send(chunk)
+                    stats.update(len(chunk))
+                    if progress_callback:
+                        progress_callback(stats)
             print(f"Sent: {rel_path}")
 
     except Exception as e:
@@ -330,6 +386,38 @@ class FileTransferApp:
                                        command=self.transfer_file, **button_style)
         self.transfer_button.pack(side=tk.LEFT, padx=5)
 
+        # Progress Frame
+        self.progress_frame = tk.Frame(transfer_frame, bg='#f0f0f0')
+        self.progress_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Progress bar
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(self.progress_frame, 
+                                          variable=self.progress_var,
+                                          maximum=100)
+        self.progress_bar.pack(fill=tk.X, pady=(5, 0))
+        
+        # Progress labels frame
+        self.progress_labels_frame = tk.Frame(self.progress_frame, bg='#f0f0f0')
+        self.progress_labels_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        # Progress details (left side)
+        self.progress_label = tk.Label(self.progress_labels_frame, 
+                                     text="", 
+                                     bg='#f0f0f0', 
+                                     font=('Helvetica', 9))
+        self.progress_label.pack(side=tk.LEFT)
+        
+        # Speed and ETA (right side)
+        self.speed_label = tk.Label(self.progress_labels_frame, 
+                                  text="", 
+                                  bg='#f0f0f0', 
+                                  font=('Helvetica', 9))
+        self.speed_label.pack(side=tk.RIGHT)
+        
+        # Initially hide progress elements
+        self.hide_progress()
+        
         # Status
         self.status_label = tk.Label(main_container, text="Status: Ready", **label_style)
         self.status_label.pack(pady=5)
@@ -482,6 +570,35 @@ class FileTransferApp:
                 size_str = f"{size/1024/1024:.1f} MB" if size > 1024*1024 else f"{size/1024:.1f} KB"
                 self.selection_label.config(text=f"Selected file: {path}\nSize: {size_str}")
 
+    def hide_progress(self):
+        """Hide progress bar and labels"""
+        self.progress_bar.pack_forget()
+        self.progress_labels_frame.pack_forget()
+        self.progress_var.set(0)
+        self.progress_label.config(text="")
+        self.speed_label.config(text="")
+        
+    def show_progress(self):
+        """Show progress bar and labels"""
+        self.progress_bar.pack(fill=tk.X, pady=(5, 0))
+        self.progress_labels_frame.pack(fill=tk.X, pady=(5, 0))
+        
+    def update_progress(self, stats):
+        """Update progress bar and labels with transfer statistics"""
+        progress = stats.get_progress() * 100
+        self.progress_var.set(progress)
+        
+        # Update progress text
+        self.progress_label.config(
+            text=f"{progress:.1f}% ({stats.get_progress_str()})")
+        
+        # Update speed and ETA
+        self.speed_label.config(
+            text=f"{stats.get_speed_str()} - {stats.get_eta_str()}")
+        
+        # Update the window to ensure progress is shown
+        self.master.update()
+
     def transfer_file(self):
         """Initiates the file transfer after ensuring a file and connection details are valid."""
         if not self.selected_file:
@@ -510,14 +627,29 @@ class FileTransferApp:
                 self.history[target_ip] = []
             self.update_destination_usage(target_ip, dest_dir)
             
-            # Perform transfer
-            self.status_label.config(text="Status: Transferring...")
-            send_file(target_ip, target_port, self.selected_file, dest_dir)
-            self.status_label.config(text="Status: Transfer completed successfully!")
+            # Clear previous status and show progress
+            self.status_label.config(text="Status: Starting transfer...")
+            self.show_progress()
+            
+            # Start transfer in a separate thread
+            def transfer_thread():
+                try:
+                    send_file(target_ip, target_port, self.selected_file, dest_dir, 
+                             progress_callback=self.update_progress)
+                    self.master.after(0, lambda: self.status_label.config(
+                        text="Status: Transfer completed successfully!"))
+                except Exception as e:
+                    self.master.after(0, lambda: self.status_label.config(
+                        text=f"Status: Transfer failed! {str(e)}"))
+                finally:
+                    self.master.after(2000, self.hide_progress)
+            
+            threading.Thread(target=transfer_thread, daemon=True).start()
             
         except Exception as e:
             messagebox.showerror("Error", f"Transfer failed: {str(e)}")
             self.status_label.config(text="Status: Transfer failed!")
+            self.hide_progress()
 
     def on_closing(self):
         """Handle window closing event"""
