@@ -117,8 +117,19 @@ def send_file(target_ip, target_port, path, target_dir, progress_callback=None, 
     transfer_record = TransferRecord()
     client_socket = None
     try:
-        # Get the base directory for relative paths
-        base_dir = os.path.dirname(path) if os.path.isfile(path) else path
+        # Get the base directory and folder name
+        if os.path.isfile(path):
+            base_dir = os.path.dirname(path)
+            is_folder = False
+        else:
+            base_dir = os.path.dirname(path)
+            is_folder = True
+            
+        # For folders, add the folder name to the target directory
+        if is_folder:
+            folder_name = os.path.basename(path)
+            target_dir = os.path.join(target_dir, folder_name)
+            
         files_to_send = []
         
         # Collect all files to send
@@ -128,7 +139,8 @@ def send_file(target_ip, target_port, path, target_dir, progress_callback=None, 
             for root, _, files in os.walk(path):
                 for file in files:
                     abs_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(abs_path, base_dir)
+                    # For folders, use path as base_dir to preserve structure
+                    rel_path = os.path.relpath(abs_path, path)
                     files_to_send.append((abs_path, rel_path))
         
         total_size = sum(os.path.getsize(f[0]) for f in files_to_send)
