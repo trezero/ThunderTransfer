@@ -6,6 +6,7 @@ import subprocess
 import requests
 import tkinter as tk
 from tkinter import filedialog, simpledialog, messagebox
+import sys
 
 # =============================================================================
 # PART 1: Driver Check and Auto-Installation
@@ -158,6 +159,21 @@ def send_file(target_ip, target_port, file_path, target_dir):
 # =============================================================================
 # PART 4: GUI Application (Tkinter based)
 # =============================================================================
+def get_thunderbolt_ip():
+    """Get the IP address of the Thunderbolt network interface"""
+    try:
+        # Look for interfaces with the Thunderbolt IP prefix (169.254)
+        for iface in socket.if_nameindex():
+            addrs = socket.getaddrinfo(socket.gethostname(), None)
+            for addr in addrs:
+                ip = addr[4][0]
+                if ip.startswith('169.254.'):
+                    return ip
+        return None
+    except Exception as e:
+        print(f"Error getting Thunderbolt IP: {e}")
+        return None
+
 class FileTransferApp:
     """
     Provides a simple GUI that:
@@ -169,6 +185,25 @@ class FileTransferApp:
     def __init__(self, master):
         self.master = master
         master.title("Thunderbolt File Transfer")
+        
+        # Set up window close handler
+        master.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # Frame for local IP display
+        self.local_ip_frame = tk.Frame(master)
+        self.local_ip_frame.pack(pady=5, padx=10, fill=tk.X)
+
+        self.local_ip_label = tk.Label(self.local_ip_frame, text="Local Thunderbolt IP:")
+        self.local_ip_label.pack(side=tk.LEFT, padx=5)
+        
+        self.local_ip_value = tk.Label(self.local_ip_frame, text="Detecting...")
+        self.local_ip_value.pack(side=tk.LEFT, padx=5)
+        
+        self.refresh_ip_button = tk.Button(self.local_ip_frame, text="Refresh", command=self.refresh_local_ip)
+        self.refresh_ip_button.pack(side=tk.LEFT, padx=5)
+        
+        self.update_ip_button = tk.Button(self.local_ip_frame, text="Update IP", command=self.update_ip)
+        self.update_ip_button.pack(side=tk.LEFT, padx=5)
 
         # Frame for connection details
         self.conn_frame = tk.Frame(master)
@@ -205,6 +240,43 @@ class FileTransferApp:
         self.transfer_button.pack(pady=10)
 
         self.selected_file = None
+
+    def refresh_local_ip(self):
+        """Refresh the displayed local Thunderbolt IP address"""
+        ip = get_thunderbolt_ip()
+        if ip:
+            self.local_ip_value.config(text=ip)
+        else:
+            self.local_ip_value.config(text="Not detected")
+            
+    def update_ip(self):
+        """Allow user to manually update the Thunderbolt IP address"""
+        current_ip = self.local_ip_value.cget("text")
+        if current_ip == "Not detected":
+            current_ip = "169.254."
+            
+        new_ip = simpledialog.askstring("Update IP", 
+                                      "Enter new Thunderbolt IP address:",
+                                      initialvalue=current_ip)
+        if new_ip:
+            if new_ip.startswith("169.254."):
+                try:
+                    # Attempt to validate IP format
+                    socket.inet_aton(new_ip)
+                    # Use netsh to set the IP address (requires admin privileges)
+                    cmd = f'netsh interface ip set address "Thunderbolt" static {new_ip} 255.255.0.0'
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        self.local_ip_value.config(text=new_ip)
+                        messagebox.showinfo("Success", "IP address updated successfully")
+                    else:
+                        messagebox.showerror("Error", 
+                            "Failed to update IP address. Make sure you have administrator privileges.")
+                except Exception as e:
+                    messagebox.showerror("Error", f"Invalid IP address format: {str(e)}")
+            else:
+                messagebox.showerror("Error", 
+                    "IP address must start with '169.254.' for Thunderbolt network")
 
     def test_connection(self):
         """Test the connection to the target computer."""
@@ -269,24 +341,30 @@ class FileTransferApp:
             self.status_label.config(text=f"Status: Transfer failed - {str(e)}", fg="red")
             messagebox.showerror("Error", f"File transfer failed: {e}")
 
+    def on_closing(self):
+        """Handle window closing event"""
+        if hasattr(self, 'server') and self.server:
+            self.server.stop()
+        self.master.quit()
+        self.master.destroy()
+
 # =============================================================================
 # PART 5: Main Execution
 # =============================================================================
 if __name__ == "__main__":
     # Step 1: Check (and auto-install if needed) the Thunderbolt driver.
     if not check_and_install_thunderbolt_driver():
-        print("Driver check failed. Exiting application.")
-        exit(1)
-
-    # Step 2: Start the file transfer server in the background.
-    server = FileTransferServer(host='', port=5001)
-    server.daemon = True  # Ensures the server thread exits when the main program does.
-    server.start()
-
-    # Step 3: Launch the GUI.
+        sys.exit(1)
+        
     root = tk.Tk()
     app = FileTransferApp(root)
+    
+    # Start the file transfer server in a daemon thread
+    app.server = FileTransferServer()
+    app.server.daemon = True  # Make sure the thread stops when the main program exits
+    app.server.start()
+    
+    # Schedule the initial IP refresh
+    root.after(100, app.refresh_local_ip)
+    
     root.mainloop()
-
-    # (Optional) When the GUI is closed, stop the server.
-    server.stop()
