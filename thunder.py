@@ -5,8 +5,13 @@ import threading
 import subprocess
 import requests
 import tkinter as tk
-from tkinter import filedialog, simpledialog, messagebox
+from tkinter import filedialog, simpledialog, messagebox, ttk
 import sys
+from datetime import datetime
+
+# Constants for the application
+APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".thundertransfer")
+HISTORY_FILE = os.path.join(APP_DATA_DIR, "transfer_history.json")
 
 # =============================================================================
 # PART 1: Driver Check and Auto-Installation
@@ -233,6 +238,9 @@ class FileTransferApp:
         # Set up window close handler
         master.protocol("WM_DELETE_WINDOW", self.on_closing)
         
+        # Initialize history
+        self.load_history()
+        
         # Create main container with padding
         main_container = tk.Frame(master, bg='#f0f0f0')
         main_container.pack(padx=20, pady=20, fill=tk.BOTH, expand=True)
@@ -269,9 +277,14 @@ class FileTransferApp:
         target_frame.pack(fill=tk.X, padx=10, pady=5)
         
         tk.Label(target_frame, text="Target IP:", **label_style).pack(side=tk.LEFT, padx=(0, 5))
-        self.ip_entry = tk.Entry(target_frame, font=('Helvetica', 10))
-        self.ip_entry.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
-        self.ip_entry.insert(0, "169.254.")
+        
+        # Combobox for target IP selection
+        self.ip_var = tk.StringVar()
+        self.ip_combo = ttk.Combobox(target_frame, textvariable=self.ip_var, font=('Helvetica', 10))
+        self.ip_combo.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+        self.ip_combo.insert(0, "169.254.")
+        self.update_ip_list()
+        self.ip_combo.bind('<<ComboboxSelected>>', self.on_ip_selected)
         
         tk.Label(target_frame, text="Port:", **label_style).pack(side=tk.LEFT, padx=(10, 5))
         self.port_entry = tk.Entry(target_frame, width=6, font=('Helvetica', 10))
@@ -284,6 +297,21 @@ class FileTransferApp:
         # Transfer Frame
         transfer_frame = tk.LabelFrame(main_container, text="Transfer", bg='#f0f0f0', fg='#333333')
         transfer_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+
+        # Destination frame
+        dest_frame = tk.Frame(transfer_frame, bg='#f0f0f0')
+        dest_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        tk.Label(dest_frame, text="Destination:", **label_style).pack(side=tk.LEFT, padx=(0, 5))
+        
+        # Combobox for destination selection
+        self.dest_var = tk.StringVar()
+        self.dest_combo = ttk.Combobox(dest_frame, textvariable=self.dest_var, font=('Helvetica', 10))
+        self.dest_combo.pack(side=tk.LEFT, expand=True, fill=tk.X)
+        
+        # Add new destination button
+        tk.Button(dest_frame, text="New", command=self.add_destination,
+                 **button_style).pack(side=tk.LEFT, padx=5)
 
         # Selection info
         self.selection_label = tk.Label(transfer_frame, text="No file/folder selected", 
@@ -308,6 +336,80 @@ class FileTransferApp:
 
         self.selected_file = None
         self.refresh_local_ip()
+
+    def load_history(self):
+        """Load transfer history from file"""
+        # Create app data directory if it doesn't exist
+        os.makedirs(APP_DATA_DIR, exist_ok=True)
+        
+        try:
+            if os.path.exists(HISTORY_FILE):
+                with open(HISTORY_FILE, 'r') as f:
+                    self.history = json.load(f)
+            else:
+                self.history = {}
+        except Exception as e:
+            print(f"Error loading history: {e}")
+            self.history = {}
+
+    def save_history(self):
+        """Save transfer history to file"""
+        try:
+            with open(HISTORY_FILE, 'w') as f:
+                json.dump(self.history, f, indent=2)
+        except Exception as e:
+            print(f"Error saving history: {e}")
+
+    def update_ip_list(self):
+        """Update the IP combobox with saved IPs"""
+        ips = list(self.history.keys())
+        if not ips:
+            ips = ["169.254."]
+        self.ip_combo['values'] = ips
+        
+    def update_destinations(self):
+        """Update the destinations combobox based on selected IP"""
+        ip = self.ip_var.get()
+        if ip in self.history:
+            destinations = [item['path'] for item in self.history[ip]]
+            self.dest_combo['values'] = destinations
+            if destinations:
+                self.dest_combo.set(destinations[0])
+        else:
+            self.dest_combo['values'] = []
+            self.dest_combo.set('')
+
+    def on_ip_selected(self, event=None):
+        """Handle IP selection change"""
+        self.update_destinations()
+
+    def add_destination(self):
+        """Add a new destination for the current IP"""
+        dest = simpledialog.askstring("New Destination", 
+                                    "Enter the destination path on the target machine:")
+        if dest:
+            ip = self.ip_var.get()
+            if ip not in self.history:
+                self.history[ip] = []
+            
+            # Check if destination already exists
+            if not any(item['path'] == dest for item in self.history[ip]):
+                self.history[ip].append({
+                    'path': dest,
+                    'last_used': datetime.now().isoformat()
+                })
+                self.save_history()
+                self.update_destinations()
+                self.dest_combo.set(dest)
+
+    def update_destination_usage(self, ip, dest):
+        """Update the last used timestamp for a destination"""
+        if ip in self.history:
+            for item in self.history[ip]:
+                if item['path'] == dest:
+                    item['last_used'] = datetime.now().isoformat()
+                    break
+            self.save_history()
 
     def refresh_local_ip(self):
         """Refresh the displayed local Thunderbolt IP address"""
@@ -348,7 +450,7 @@ class FileTransferApp:
 
     def test_connection(self):
         """Test the connection to the target computer."""
-        target_ip = self.ip_entry.get().strip()
+        target_ip = self.ip_var.get().strip()
         target_port = int(self.port_entry.get().strip())
 
         try:
@@ -383,36 +485,39 @@ class FileTransferApp:
     def transfer_file(self):
         """Initiates the file transfer after ensuring a file and connection details are valid."""
         if not self.selected_file:
-            messagebox.showwarning("No File", "Please select a file first.")
+            messagebox.showerror("Error", "Please select a file or folder first.")
             return
-
-        target_ip = self.ip_entry.get().strip()
+        
+        target_ip = self.ip_var.get()
         if not target_ip:
-            messagebox.showwarning("No IP", "Please enter the target IP address.")
+            messagebox.showerror("Error", "Please enter a target IP address.")
             return
-
+            
         try:
-            target_port = int(self.port_entry.get().strip())
+            target_port = int(self.port_entry.get())
         except ValueError:
-            messagebox.showwarning("Invalid Port", "Please enter a valid port number.")
+            messagebox.showerror("Error", "Invalid port number.")
             return
-
-        # Ask the user for the destination folder on the target computer
-        target_dir = simpledialog.askstring("Target Directory", 
-            "Enter destination directory on target computer:\n"
-            "(e.g., C:\\Users\\username\\Downloads)")
-        if not target_dir:
-            messagebox.showwarning("No Directory", "Destination directory is required.")
+            
+        dest_dir = self.dest_var.get()
+        if not dest_dir:
+            messagebox.showerror("Error", "Please select or enter a destination directory.")
             return
-
+        
         try:
-            self.status_label.config(text="Status: Transferring file...", fg="blue")
-            send_file(target_ip, target_port, self.selected_file, target_dir)
-            self.status_label.config(text="Status: File transferred successfully!", fg="green")
-            messagebox.showinfo("Success", "File transferred successfully!")
+            # Update history
+            if target_ip not in self.history:
+                self.history[target_ip] = []
+            self.update_destination_usage(target_ip, dest_dir)
+            
+            # Perform transfer
+            self.status_label.config(text="Status: Transferring...")
+            send_file(target_ip, target_port, self.selected_file, dest_dir)
+            self.status_label.config(text="Status: Transfer completed successfully!")
+            
         except Exception as e:
-            self.status_label.config(text=f"Status: Transfer failed - {str(e)}", fg="red")
-            messagebox.showerror("Error", f"File transfer failed: {e}")
+            messagebox.showerror("Error", f"Transfer failed: {str(e)}")
+            self.status_label.config(text="Status: Transfer failed!")
 
     def on_closing(self):
         """Handle window closing event"""

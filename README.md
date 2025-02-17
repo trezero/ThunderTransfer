@@ -1,17 +1,27 @@
-# Thunder.py
+# ThunderTransfer
 
-Thunder.py is a Python-based application that enables high-speed file transfers between two Windows laptops over a Thunderbolt USB-C cable. The application checks for the necessary Thunderbolt drivers (installing them automatically if needed), sets up a file transfer server, and provides a simple graphical interface for users to drag and drop files to remote machines.
+ThunderTransfer is a Python-based application that enables high-speed file transfers between two Windows laptops over a Thunderbolt USB-C cable. The application checks for the necessary Thunderbolt drivers (installing them automatically if needed), sets up a file transfer server, and provides a modern graphical interface for transferring files and folders to remote machines.
 
 ## Features
 
 - **Driver Verification & Auto-Installation:**  
-  Checks for Thunderbolt drivers using Windows commands and downloads/installs them automatically if missing.
+  Checks for Thunderbolt drivers using Windows commands and guides you through the installation process if missing.
   
-- **File Transfer Server:**  
-  Runs a background TCP server to receive files on the destination machine.
+- **File & Folder Transfer Support:**  
+  - Transfer individual files or entire folders while maintaining directory structure
+  - Automatic handling of nested directories and multiple files
+  - Progress tracking during transfers
 
-- **User-Friendly GUI:**  
-  Provides a Tkinter interface for selecting files, viewing available computers on the network, and initiating file transfers.
+- **Modern User Interface:**  
+  - Clean, modern design with improved visibility
+  - Easy-to-use file and folder selection
+  - Clear feedback on transfer status and file information
+
+- **Smart History Management:**
+  - Remembers previously used target IP addresses
+  - Stores destination folders for each target IP
+  - Quick access to frequently used destinations
+  - Automatically updates usage history
 
 - **High-Speed Direct Transfer:**  
   Utilizes a direct Thunderbolt network connection for rapid and secure file transfers.
@@ -28,11 +38,11 @@ Thunder.py is a Python-based application that enables high-speed file transfers 
 
 1. **Clone the Repository:**
    ```bash
-   git clone https://github.com/your-username/thunder.git
-   cd thunder
+   git clone https://github.com/your-username/ThunderTransfer.git
+   cd ThunderTransfer
    ```
 
-2. **Create a Virtual Environment (Optional):**
+2. **Create a Virtual Environment (Optional but recommended):**
    ```bash
    python -m venv venv
    venv\Scripts\activate
@@ -45,7 +55,7 @@ Thunder.py is a Python-based application that enables high-speed file transfers 
 
 ## Configuration
 
-### Driver Installer
+### Driver Installation
 The application will check if the Thunderbolt driver is installed. If not detected, you have two options:
 
 1. **Recommended Method**: Use Lenovo System Update / Lenovo Vantage
@@ -55,15 +65,12 @@ The application will check if the Thunderbolt driver is installed. If not detect
 
 2. **Manual Method**: Download from Lenovo Support
    - Visit https://support.lenovo.com
-   - Enter your machine type (for ThinkPad P1 Gen 6)
+   - Enter your machine type
    - Navigate to "Drivers & Software"
    - Filter by "Thunderbolt/USB"
    - Download and install the latest "Intel Thunderbolt Driver"
 
 Note: Administrator privileges are required for driver installation.
-
-### Port Configuration
-The file transfer server listens on TCP port 5001 by default. Adjust this in the code if needed.
 
 ## Usage
 
@@ -73,49 +80,60 @@ Execute the application with:
 python thunder.py
 ```
 
-### Driver Check & Installation
-- On startup, the application checks for the presence of Thunderbolt drivers using the `driverquery` command
-- If the driver is not detected, the script will prompt the user to install the driver using one of the methods above
-- Note: Administrator privileges might be required for this step
+### Using the Interface
 
-### Using the GUI
+1. **Connection Settings:**
+   - Your local Thunderbolt IP is displayed at the top
+   - Use the "Refresh" button to update your IP
+   - Select a target IP from the dropdown or type a new one
+   - Default port is 5001
 
-1. **Available Computers:**
-   - The main window displays a list of available computers on the network
-   - Click "Refresh List" to update the list
+2. **Managing Destinations:**
+   - Select from previously used destinations in the dropdown
+   - Click "New" to add a new destination folder
+   - Destinations are saved per target IP
+   - Most recently used destinations appear first
 
-2. **Select File/Folder:**
-   - Click "Select File/Folder" to choose a file (or folder) to transfer
+3. **File/Folder Transfer:**
+   - Click "Select File/Folder" to choose what to transfer
+   - The interface will show file/folder details:
+     - For files: Name and size
+     - For folders: Path and total number of files
+   - Click "Transfer" to start the transfer process
 
-3. **Initiate Transfer:**
-   - Select a target computer from the list
-   - Click "Transfer"
-   - Enter the destination directory on the target computer when prompted
+4. **History Management:**
+   - Transfer history is automatically saved
+   - History is stored in `~/.thundertransfer/transfer_history.json`
+   - Includes target IPs and their associated destinations
+   - Timestamps track when destinations were last used
 
 ### Background Server
-The file transfer server runs in the background to receive incoming transfers. It saves received files to the specified destination folder on the receiving machine.
+The file transfer server runs in the background to receive incoming transfers. It automatically:
+- Creates destination directories if they don't exist
+- Maintains folder structure for folder transfers
+- Handles multiple files in sequence
+- Provides progress feedback during transfers
 
 ## Troubleshooting
 
-### Driver Installation Failures
-- Ensure that you are running the application with administrator rights
-- Double-check the URL for the driver installer
+### Connection Issues
+1. **IP Address Problems:**
+   - Ensure both computers are connected via Thunderbolt cable
+   - Check that both machines have Thunderbolt IPs (usually starting with 169.254)
+   - Use the "Test Connection" button to verify connectivity
 
-### Network Connection Issues
-- Verify that both laptops are connected using a Thunderbolt USB-C cable
-- Confirm that both systems support Thunderbolt networking
+2. **Transfer Failures:**
+   - Verify the destination path exists on the target machine
+   - Ensure you have write permissions for the destination
+   - Check that the target machine is running ThunderTransfer
+   - Verify the port (5001) is not blocked by firewall
 
-### Permission Errors
-- Make sure the destination directory exists and that you have write permissions on it
+### Driver Installation
+- Ensure you have administrator rights
+- If automatic installation fails, try the manual installation method
+- Restart both computers after driver installation
 
-## Security Considerations
-Thunder.py is designed for secure on-premises file transfers over a direct cable connection. For enhanced security, consider implementing additional encryption or authentication mechanisms if deploying in less controlled environments.
-
-## Contributing
-Contributions, bug reports, and suggestions are welcome. Feel free to fork the repository and submit a pull request with your improvements.
-
-## License
-This project is licensed under the MIT License. See the LICENSE file for more details.
-
-## Contact
-For support or inquiries, please open an issue in the GitHub repository.
+## Data Storage
+- Transfer history is stored in: `~/.thundertransfer/transfer_history.json`
+- The history file is created automatically on first use
+- You can safely delete the history file to reset saved destinations
