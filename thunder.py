@@ -52,12 +52,12 @@ class FileTransferServer(threading.Thread):
     The protocol:
       - Receive 4 bytes indicating header length.
       - Receive JSON header with:
-          target_dir, file_name, file_size.
+          target_dir, is_folder, items.
       - Receive the file content and save it under target_dir.
     """
     def __init__(self, host='', port=5001):
         super().__init__()
-        self.host = host  # Bind to all interfaces by default
+        self.host = host
         self.port = port
         self.server_socket = None
         self.is_running = False
@@ -89,27 +89,41 @@ class FileTransferServer(threading.Thread):
             header_data = client_socket.recv(header_length).decode()
             header = json.loads(header_data)
             target_dir = header.get("target_dir")
-            file_name = header.get("file_name")
-            file_size = header.get("file_size")
-            print(f"Incoming file: {file_name} ({file_size} bytes) to be saved in {target_dir}")
+            is_folder = header.get("is_folder", False)
+            items = header.get("items", [])
             
-            # Ensure the target directory exists
+            # Create base target directory if it doesn't exist
             if not os.path.exists(target_dir):
                 os.makedirs(target_dir)
-            file_path = os.path.join(target_dir, file_name)
-            
-            # Receive the file data
-            with open(file_path, 'wb') as f:
-                remaining = file_size
-                while remaining > 0:
-                    chunk = client_socket.recv(min(4096, remaining))
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    remaining -= len(chunk)
-            print("File received and saved to:", file_path)
+
+            for item in items:
+                rel_path = item["rel_path"]
+                size = item["size"]
+                is_dir = item["is_dir"]
+                
+                full_path = os.path.join(target_dir, rel_path)
+                
+                if is_dir:
+                    os.makedirs(full_path, exist_ok=True)
+                    continue
+                
+                # Ensure the parent directory exists
+                os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                
+                # Receive and save the file
+                with open(full_path, 'wb') as f:
+                    remaining = size
+                    while remaining > 0:
+                        chunk_size = min(remaining, 8192)
+                        chunk = client_socket.recv(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        remaining -= len(chunk)
+                print(f"Saved: {full_path}")
+                
         except Exception as e:
-            print("Error handling incoming file:", e)
+            print("Error handling client:", e)
         finally:
             client_socket.close()
 
@@ -126,35 +140,68 @@ class FileTransferServer(threading.Thread):
 # =============================================================================
 # PART 3: File Transfer Client Function
 # =============================================================================
-def send_file(target_ip, target_port, file_path, target_dir):
-    """
-    Connects to the target computer and sends the selected file.
-    The function creates a JSON header containing the target directory,
-    file name, and file size, then sends the header (prefixed by its length)
-    followed by the file content.
-    """
-    file_name = os.path.basename(file_path)
-    file_size = os.path.getsize(file_path)
-    header = {
-        "target_dir": target_dir,
-        "file_name": file_name,
-        "file_size": file_size
-    }
-    header_json = json.dumps(header).encode()
-    header_length = len(header_json)
-    header_length_bytes = header_length.to_bytes(4, byteorder='big')
-    
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((target_ip, target_port))
-        s.sendall(header_length_bytes)
-        s.sendall(header_json)
-        with open(file_path, 'rb') as f:
-            while True:
-                chunk = f.read(4096)
-                if not chunk:
-                    break
-                s.sendall(chunk)
-    print("File sent successfully.")
+def send_file(target_ip, target_port, path, target_dir):
+    try:
+        # Connect to the server
+        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_socket.connect((target_ip, target_port))
+
+        # Prepare the file list and metadata
+        items = []
+        files_to_send = []
+        
+        if os.path.isfile(path):
+            # Single file
+            rel_path = os.path.basename(path)
+            size = os.path.getsize(path)
+            items.append({"rel_path": rel_path, "size": size, "is_dir": False})
+            files_to_send.append((path, rel_path, size))
+        else:
+            # Directory
+            base_path = os.path.dirname(path)
+            for root, dirs, files in os.walk(path):
+                # Add directories
+                for dir_name in dirs:
+                    full_dir_path = os.path.join(root, dir_name)
+                    rel_path = os.path.relpath(full_dir_path, base_path)
+                    items.append({"rel_path": rel_path, "size": 0, "is_dir": True})
+                
+                # Add files
+                for file_name in files:
+                    full_file_path = os.path.join(root, file_name)
+                    rel_path = os.path.relpath(full_file_path, base_path)
+                    size = os.path.getsize(full_file_path)
+                    items.append({"rel_path": rel_path, "size": size, "is_dir": False})
+                    files_to_send.append((full_file_path, rel_path, size))
+
+        # Prepare and send header
+        header = {
+            "target_dir": target_dir,
+            "is_folder": os.path.isdir(path),
+            "items": items
+        }
+        header_json = json.dumps(header)
+        header_bytes = header_json.encode()
+        
+        # Send header length first (4 bytes, big-endian)
+        client_socket.send(len(header_bytes).to_bytes(4, byteorder='big'))
+        # Send the header itself
+        client_socket.send(header_bytes)
+
+        # Send all files
+        for full_path, rel_path, size in files_to_send:
+            with open(full_path, 'rb') as f:
+                while True:
+                    chunk = f.read(8192)
+                    if not chunk:
+                        break
+                    client_socket.send(chunk)
+            print(f"Sent: {rel_path}")
+
+    except Exception as e:
+        raise Exception(f"Failed to send file: {str(e)}")
+    finally:
+        client_socket.close()
 
 # =============================================================================
 # PART 4: GUI Application (Tkinter based)
@@ -175,71 +222,92 @@ def get_thunderbolt_ip():
         return None
 
 class FileTransferApp:
-    """
-    Provides a simple GUI that:
-      - Lists available computers on the network.
-      - Lets the user select a file (or folder, if extended).
-      - Asks for the destination folder on the target computer.
-      - Initiates the file transfer.
-    """
     def __init__(self, master):
         self.master = master
-        master.title("Thunderbolt File Transfer")
+        master.title("ThunderTransfer")
+        
+        # Configure window
+        master.geometry("800x600")
+        master.configure(bg='#f0f0f0')
         
         # Set up window close handler
         master.protocol("WM_DELETE_WINDOW", self.on_closing)
-
-        # Frame for local IP display
-        self.local_ip_frame = tk.Frame(master)
-        self.local_ip_frame.pack(pady=5, padx=10, fill=tk.X)
-
-        self.local_ip_label = tk.Label(self.local_ip_frame, text="Local Thunderbolt IP:")
-        self.local_ip_label.pack(side=tk.LEFT, padx=5)
         
-        self.local_ip_value = tk.Label(self.local_ip_frame, text="Detecting...")
+        # Create main container with padding
+        main_container = tk.Frame(master, bg='#f0f0f0')
+        main_container.pack(padx=20, pady=20, fill=tk.BOTH, expand=True)
+        
+        # Style configuration
+        title_style = {'bg': '#f0f0f0', 'fg': '#333333', 'font': ('Helvetica', 16, 'bold')}
+        label_style = {'bg': '#f0f0f0', 'fg': '#333333', 'font': ('Helvetica', 10)}
+        button_style = {'bg': '#2196F3', 'fg': 'white', 'font': ('Helvetica', 10, 'bold'),
+                       'relief': tk.FLAT, 'padx': 15, 'pady': 8}
+        
+        # Title
+        title_label = tk.Label(main_container, text="ThunderTransfer", **title_style)
+        title_label.pack(pady=(0, 20))
+
+        # Connection Frame
+        conn_frame = tk.LabelFrame(main_container, text="Connection Settings", bg='#f0f0f0', fg='#333333')
+        conn_frame.pack(fill=tk.X, pady=(0, 15))
+
+        # IP Frame
+        ip_frame = tk.Frame(conn_frame, bg='#f0f0f0')
+        ip_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        tk.Label(ip_frame, text="Local TB IP:", **label_style).pack(side=tk.LEFT, padx=(0, 5))
+        self.local_ip_value = tk.Label(ip_frame, text="Detecting...", **label_style)
         self.local_ip_value.pack(side=tk.LEFT, padx=5)
         
-        self.refresh_ip_button = tk.Button(self.local_ip_frame, text="Refresh", command=self.refresh_local_ip)
-        self.refresh_ip_button.pack(side=tk.LEFT, padx=5)
+        tk.Button(ip_frame, text="Refresh", command=self.refresh_local_ip,
+                 **button_style).pack(side=tk.LEFT, padx=5)
+        tk.Button(ip_frame, text="Update IP", command=self.update_ip,
+                 **button_style).pack(side=tk.LEFT, padx=5)
+
+        # Target IP Frame
+        target_frame = tk.Frame(conn_frame, bg='#f0f0f0')
+        target_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        self.update_ip_button = tk.Button(self.local_ip_frame, text="Update IP", command=self.update_ip)
-        self.update_ip_button.pack(side=tk.LEFT, padx=5)
-
-        # Frame for connection details
-        self.conn_frame = tk.Frame(master)
-        self.conn_frame.pack(pady=10, padx=10, fill=tk.X)
-
-        # IP Entry
-        self.ip_label = tk.Label(self.conn_frame, text="Target IP:")
-        self.ip_label.pack(side=tk.LEFT, padx=5)
-        self.ip_entry = tk.Entry(self.conn_frame)
+        tk.Label(target_frame, text="Target IP:", **label_style).pack(side=tk.LEFT, padx=(0, 5))
+        self.ip_entry = tk.Entry(target_frame, font=('Helvetica', 10))
         self.ip_entry.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
-        self.ip_entry.insert(0, "169.254.") # Default Thunderbolt network prefix
-
-        # Port Entry
-        self.port_label = tk.Label(self.conn_frame, text="Port:")
-        self.port_label.pack(side=tk.LEFT, padx=5)
-        self.port_entry = tk.Entry(self.conn_frame, width=6)
+        self.ip_entry.insert(0, "169.254.")
+        
+        tk.Label(target_frame, text="Port:", **label_style).pack(side=tk.LEFT, padx=(10, 5))
+        self.port_entry = tk.Entry(target_frame, width=6, font=('Helvetica', 10))
         self.port_entry.pack(side=tk.LEFT, padx=5)
         self.port_entry.insert(0, "5001")
+        
+        tk.Button(target_frame, text="Test Connection", command=self.test_connection,
+                 **button_style).pack(side=tk.LEFT, padx=5)
 
-        # Test Connection button
-        self.test_conn_button = tk.Button(self.conn_frame, text="Test Connection", command=self.test_connection)
-        self.test_conn_button.pack(side=tk.LEFT, padx=5)
+        # Transfer Frame
+        transfer_frame = tk.LabelFrame(main_container, text="Transfer", bg='#f0f0f0', fg='#333333')
+        transfer_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
 
-        # Status label
-        self.status_label = tk.Label(master, text="Status: Ready")
+        # Selection info
+        self.selection_label = tk.Label(transfer_frame, text="No file/folder selected", 
+                                      **label_style, wraplength=700)
+        self.selection_label.pack(pady=10, padx=10)
+
+        # Buttons frame
+        buttons_frame = tk.Frame(transfer_frame, bg='#f0f0f0')
+        buttons_frame.pack(pady=10)
+        
+        select_button = tk.Button(buttons_frame, text="Select File/Folder", 
+                                command=self.select_file, **button_style)
+        select_button.pack(side=tk.LEFT, padx=5)
+        
+        self.transfer_button = tk.Button(buttons_frame, text="Transfer", 
+                                       command=self.transfer_file, **button_style)
+        self.transfer_button.pack(side=tk.LEFT, padx=5)
+
+        # Status
+        self.status_label = tk.Label(main_container, text="Status: Ready", **label_style)
         self.status_label.pack(pady=5)
 
-        # Button to select file or folder
-        self.select_file_button = tk.Button(master, text="Select File/Folder", command=self.select_file)
-        self.select_file_button.pack(pady=5)
-
-        # Button to start the transfer
-        self.transfer_button = tk.Button(master, text="Transfer", command=self.transfer_file)
-        self.transfer_button.pack(pady=10)
-
         self.selected_file = None
+        self.refresh_local_ip()
 
     def refresh_local_ip(self):
         """Refresh the displayed local Thunderbolt IP address"""
@@ -301,11 +369,16 @@ class FileTransferApp:
                 "4. Port number matches the server")
 
     def select_file(self):
-        """Opens a file dialog for the user to select a file to transfer."""
-        file_path = filedialog.askopenfilename()
-        if file_path:
-            self.selected_file = file_path
-            self.status_label.config(text=f"Status: Selected file: {os.path.basename(file_path)}")
+        path = filedialog.askdirectory() or filedialog.askopenfilename()
+        if path:
+            self.selected_file = path
+            if os.path.isdir(path):
+                num_files = sum([len(files) for _, _, files in os.walk(path)])
+                self.selection_label.config(text=f"Selected folder: {path}\nContains {num_files} files")
+            else:
+                size = os.path.getsize(path)
+                size_str = f"{size/1024/1024:.1f} MB" if size > 1024*1024 else f"{size/1024:.1f} KB"
+                self.selection_label.config(text=f"Selected file: {path}\nSize: {size_str}")
 
     def transfer_file(self):
         """Initiates the file transfer after ensuring a file and connection details are valid."""
