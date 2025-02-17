@@ -10,282 +10,227 @@ import sys
 from datetime import datetime
 import time
 import humanize
+import paramiko
+import hashlib
+from pathlib import Path
 
 # Constants for the application
 APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".thundertransfer")
 HISTORY_FILE = os.path.join(APP_DATA_DIR, "transfer_history.json")
+CREDENTIALS_FILE = os.path.join(APP_DATA_DIR, "credentials.json")
 CHUNK_SIZE = 8192  # 8KB chunks for transfer
+MAX_RETRIES = 10
+RETRY_DELAY = 2  # seconds between retries
 
 class TransferStats:
-    def __init__(self, total_size):
+    def __init__(self, total_size, resumed_size=0):
         self.total_size = total_size
-        self.transferred = 0
+        self.transferred = resumed_size
         self.start_time = time.time()
         self.last_update = self.start_time
-        self.last_transferred = 0
-        self.current_speed = 0  # bytes per second
+        self.last_transferred = resumed_size
+        self.current_speed = 0
+        self.retries = 0
         
-    def update(self, additional_bytes):
-        current_time = time.time()
-        self.transferred += additional_bytes
+    def increment_retries(self):
+        self.retries += 1
+        return self.retries <= MAX_RETRIES
         
-        # Update speed calculation every second
-        time_diff = current_time - self.last_update
-        if time_diff >= 1.0:
-            bytes_since_last = self.transferred - self.last_transferred
-            self.current_speed = bytes_since_last / time_diff
-            self.last_update = current_time
-            self.last_transferred = self.transferred
-            
-    def get_progress(self):
-        return (self.transferred / self.total_size) if self.total_size > 0 else 0
-        
-    def get_eta(self):
-        if self.current_speed > 0:
-            remaining_bytes = self.total_size - self.transferred
-            return remaining_bytes / self.current_speed
-        return 0
-        
-    def get_speed_str(self):
-        return humanize.naturalsize(self.current_speed, binary=True) + "/s"
-        
-    def get_progress_str(self):
-        return f"{humanize.naturalsize(self.transferred, binary=True)} / {humanize.naturalsize(self.total_size, binary=True)}"
-        
-    def get_eta_str(self):
-        eta = self.get_eta()
-        if eta <= 0:
-            return "calculating..."
-        return humanize.naturaltime(-eta, future=True)
+    def reset_speed(self):
+        self.last_update = time.time()
+        self.last_transferred = self.transferred
 
-# =============================================================================
-# PART 1: Driver Check and Auto-Installation
-# =============================================================================
-def check_and_install_thunderbolt_driver():
-    """
-    Checks if the Thunderbolt driver is installed.
-    If not found, guides the user to install it using Lenovo System Update.
-    """
-    try:
-        # Run driverquery to list drivers in CSV format
-        output = subprocess.check_output(["driverquery", "/FO", "CSV"], text=True)
-        if "Thunderbolt" in output:
-            print("Thunderbolt driver is installed.")
-            return True
-        else:
-            print("Thunderbolt driver not found.")
-            messagebox.showinfo("Driver Installation Required", 
-                "Thunderbolt driver is not installed. Please install it using one of these methods:\n\n"
-                "1. Recommended: Use Lenovo System Update\n"
-                "   - Download from: support.lenovo.com/solutions/ht003029\n"
-                "   - Run System Update\n"
-                "   - Install 'Intel Thunderbolt Driver'\n\n"
-                "2. Manual Installation:\n"
-                "   - Visit support.lenovo.com\n"
-                "   - Enter your machine type\n"
-                "   - Go to Drivers & Software\n"
-                "   - Find and install 'Intel Thunderbolt Driver'\n\n"
-                "After installation, please restart this application."
-            )
-            return False
-    except Exception as e:
-        print("Error checking Thunderbolt driver:", e)
-        messagebox.showerror("Error", f"Failed to check Thunderbolt driver status: {str(e)}")
-        return False
-
-# =============================================================================
-# PART 2: File Transfer Server (to be run on the receiving machine)
-# =============================================================================
-class FileTransferServer(threading.Thread):
-    """
-    A simple TCP server that listens for incoming file transfers.
-    The protocol:
-      - Receive 4 bytes indicating header length.
-      - Receive JSON header with:
-          target_dir, is_folder, items.
-      - Receive the file content and save it under target_dir.
-    """
-    def __init__(self, host='', port=5001):
-        super().__init__()
-        self.host = host
-        self.port = port
-        self.server_socket = None
-        self.is_running = False
-
-    def run(self):
-        self.is_running = True
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(5)
-        print("FileTransferServer listening on port", self.port)
-        while self.is_running:
-            try:
-                client_socket, addr = self.server_socket.accept()
-                print("Accepted connection from", addr)
-                threading.Thread(target=self.handle_client, args=(client_socket,), daemon=True).start()
-            except Exception as e:
-                print("Server error:", e)
-        self.server_socket.close()
-
-    def handle_client(self, client_socket):
+class SSHManager:
+    def __init__(self):
+        self.credentials = self.load_credentials()
+        
+    def load_credentials(self):
         try:
-            # Receive header length (first 4 bytes, big-endian)
-            header_length_bytes = client_socket.recv(4)
-            if not header_length_bytes:
-                return
-            header_length = int.from_bytes(header_length_bytes, byteorder='big')
-            
-            # Now receive the JSON header
-            header_data = client_socket.recv(header_length).decode()
-            header = json.loads(header_data)
-            target_dir = header.get("target_dir")
-            is_folder = header.get("is_folder", False)
-            items = header.get("items", [])
-            
-            # Create base target directory if it doesn't exist
-            if not os.path.exists(target_dir):
-                os.makedirs(target_dir)
-
-            for item in items:
-                rel_path = item["rel_path"]
-                size = item["size"]
-                is_dir = item["is_dir"]
-                
-                full_path = os.path.join(target_dir, rel_path)
-                
-                if is_dir:
-                    os.makedirs(full_path, exist_ok=True)
-                    continue
-                
-                # Ensure the parent directory exists
-                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                
-                # Receive and save the file
-                with open(full_path, 'wb') as f:
-                    remaining = size
-                    while remaining > 0:
-                        chunk_size = min(remaining, CHUNK_SIZE)
-                        chunk = client_socket.recv(chunk_size)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        remaining -= len(chunk)
-                print(f"Saved: {full_path}")
-                
-        except Exception as e:
-            print("Error handling client:", e)
-        finally:
-            client_socket.close()
-
-    def stop(self):
-        self.is_running = False
-        # Create a dummy connection to unblock accept()
-        try:
-            dummy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            dummy.connect((self.host, self.port))
-            dummy.close()
+            if os.path.exists(CREDENTIALS_FILE):
+                with open(CREDENTIALS_FILE, 'r') as f:
+                    return json.load(f)
+            return {}
         except Exception:
-            pass
+            return {}
+            
+    def save_credentials(self):
+        try:
+            os.makedirs(APP_DATA_DIR, exist_ok=True)
+            with open(CREDENTIALS_FILE, 'w') as f:
+                json.dump(self.credentials, f)
+        except Exception as e:
+            print(f"Error saving credentials: {e}")
+            
+    def get_credentials(self, host):
+        return self.credentials.get(host, {})
+        
+    def set_credentials(self, host, username, password):
+        self.credentials[host] = {
+            "username": username,
+            "password": password
+        }
+        self.save_credentials()
+        
+    def check_remote_file(self, host, remote_path):
+        creds = self.get_credentials(host)
+        if not creds:
+            return None
+            
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(host, username=creds["username"], password=creds["password"])
+            
+            sftp = ssh.open_sftp()
+            try:
+                attrs = sftp.stat(remote_path)
+                return attrs.st_size
+            except FileNotFoundError:
+                return 0
+        except Exception as e:
+            print(f"SSH error: {e}")
+            return None
+        finally:
+            try:
+                ssh.close()
+            except:
+                pass
 
-# =============================================================================
-# PART 3: File Transfer Client Function
-# =============================================================================
-def send_file(target_ip, target_port, path, target_dir, progress_callback=None):
+def send_file(target_ip, target_port, path, target_dir, progress_callback=None, ssh_manager=None):
+    stats = None
+    client_socket = None
+    
     try:
-        # Connect to the server
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client_socket.connect((target_ip, target_port))
-
-        # Prepare the file list and metadata
+        # Prepare file list and check existing files
         items = []
         files_to_send = []
         total_size = 0
+        resumed_size = 0
         
         if os.path.isfile(path):
-            # Single file
             size = os.path.getsize(path)
             total_size = size
             rel_path = os.path.basename(path)
-            items.append({"rel_path": rel_path, "size": size, "is_dir": False})
-            files_to_send.append((path, rel_path, size))
+            remote_path = os.path.join(target_dir, rel_path).replace('\\', '/')
+            
+            if ssh_manager:
+                existing_size = ssh_manager.check_remote_file(target_ip, remote_path)
+                if existing_size is not None and existing_size > 0:
+                    if existing_size == size:
+                        # File already exists and is complete
+                        return
+                    resumed_size = existing_size
+            
+            items.append({
+                "rel_path": rel_path,
+                "size": size,
+                "is_dir": False,
+                "resume_position": resumed_size
+            })
+            files_to_send.append((path, rel_path, size, resumed_size))
         else:
-            # Directory
             base_path = os.path.dirname(path)
             for root, dirs, files in os.walk(path):
-                # Add directories
                 for dir_name in dirs:
                     full_dir_path = os.path.join(root, dir_name)
                     rel_path = os.path.relpath(full_dir_path, base_path)
                     items.append({"rel_path": rel_path, "size": 0, "is_dir": True})
                 
-                # Add files
                 for file_name in files:
                     full_file_path = os.path.join(root, file_name)
                     rel_path = os.path.relpath(full_file_path, base_path)
                     size = os.path.getsize(full_file_path)
+                    remote_path = os.path.join(target_dir, rel_path).replace('\\', '/')
+                    
+                    resume_position = 0
+                    if ssh_manager:
+                        existing_size = ssh_manager.check_remote_file(target_ip, remote_path)
+                        if existing_size is not None:
+                            if existing_size == size:
+                                continue  # Skip this file, it's already complete
+                            resume_position = existing_size
+                    
                     total_size += size
-                    items.append({"rel_path": rel_path, "size": size, "is_dir": False})
-                    files_to_send.append((full_file_path, rel_path, size))
+                    resumed_size += resume_position
+                    items.append({
+                        "rel_path": rel_path,
+                        "size": size,
+                        "is_dir": False,
+                        "resume_position": resume_position
+                    })
+                    files_to_send.append((full_file_path, rel_path, size, resume_position))
 
-        # Initialize transfer stats
-        stats = TransferStats(total_size)
+        # Initialize transfer stats with resumed size
+        stats = TransferStats(total_size, resumed_size)
         if progress_callback:
             progress_callback(stats)
 
-        # Prepare and send header
-        header = {
-            "target_dir": target_dir,
-            "is_folder": os.path.isdir(path),
-            "items": items
-        }
-        header_json = json.dumps(header)
-        header_bytes = header_json.encode()
-        
-        # Send header length first (4 bytes, big-endian)
-        client_socket.send(len(header_bytes).to_bytes(4, byteorder='big'))
-        # Send the header itself
-        client_socket.send(header_bytes)
+        while True:
+            try:
+                # Connect to the server
+                client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                client_socket.connect((target_ip, target_port))
 
-        # Send all files
-        for full_path, rel_path, size in files_to_send:
-            with open(full_path, 'rb') as f:
-                while True:
-                    chunk = f.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    client_socket.send(chunk)
-                    stats.update(len(chunk))
-                    if progress_callback:
-                        progress_callback(stats)
-            print(f"Sent: {rel_path}")
+                # Send header
+                header = {
+                    "target_dir": target_dir,
+                    "is_folder": os.path.isdir(path),
+                    "items": items
+                }
+                header_json = json.dumps(header)
+                header_bytes = header_json.encode()
+                
+                client_socket.send(len(header_bytes).to_bytes(4, byteorder='big'))
+                client_socket.send(header_bytes)
+
+                # Send all files
+                for full_path, rel_path, size, resume_position in files_to_send:
+                    with open(full_path, 'rb') as f:
+                        # Seek to resume position if needed
+                        if resume_position > 0:
+                            f.seek(resume_position)
+                            
+                        while True:
+                            chunk = f.read(CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            client_socket.send(chunk)
+                            stats.update(len(chunk))
+                            if progress_callback:
+                                progress_callback(stats)
+                    print(f"Sent: {rel_path}")
+                
+                # If we get here, transfer was successful
+                break
+                
+            except socket.error as e:
+                if client_socket:
+                    client_socket.close()
+                    client_socket = None
+                
+                if not stats.increment_retries():
+                    raise Exception(f"Max retries ({MAX_RETRIES}) exceeded. Last error: {str(e)}")
+                
+                if progress_callback:
+                    progress_callback(stats)
+                
+                print(f"Connection error (attempt {stats.retries}/{MAX_RETRIES}): {e}")
+                time.sleep(RETRY_DELAY)
+                stats.reset_speed()
 
     except Exception as e:
         raise Exception(f"Failed to send file: {str(e)}")
     finally:
-        client_socket.close()
-
-# =============================================================================
-# PART 4: GUI Application (Tkinter based)
-# =============================================================================
-def get_thunderbolt_ip():
-    """Get the IP address of the Thunderbolt network interface"""
-    try:
-        # Look for interfaces with the Thunderbolt IP prefix (169.254)
-        for iface in socket.if_nameindex():
-            addrs = socket.getaddrinfo(socket.gethostname(), None)
-            for addr in addrs:
-                ip = addr[4][0]
-                if ip.startswith('169.254.'):
-                    return ip
-        return None
-    except Exception as e:
-        print(f"Error getting Thunderbolt IP: {e}")
-        return None
+        if client_socket:
+            client_socket.close()
 
 class FileTransferApp:
     def __init__(self, master):
         self.master = master
         master.title("ThunderTransfer")
+        
+        # Initialize SSH manager
+        self.ssh_manager = SSHManager()
         
         # Configure window
         master.geometry("800x600")
@@ -422,6 +367,29 @@ class FileTransferApp:
         self.status_label = tk.Label(main_container, text="Status: Ready", **label_style)
         self.status_label.pack(pady=5)
 
+        # SSH Credentials Frame
+        ssh_frame = tk.LabelFrame(main_container, text="SSH Credentials (Optional)", bg='#f0f0f0', fg='#333333')
+        ssh_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        ssh_inner_frame = tk.Frame(ssh_frame, bg='#f0f0f0')
+        ssh_inner_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        tk.Label(ssh_inner_frame, text="Username:", **label_style).pack(side=tk.LEFT, padx=(0, 5))
+        self.ssh_username = tk.Entry(ssh_inner_frame, font=('Helvetica', 10))
+        self.ssh_username.pack(side=tk.LEFT, padx=5)
+        
+        tk.Label(ssh_inner_frame, text="Password:", **label_style).pack(side=tk.LEFT, padx=(10, 5))
+        self.ssh_password = tk.Entry(ssh_inner_frame, font=('Helvetica', 10), show='*')
+        self.ssh_password.pack(side=tk.LEFT, padx=5)
+        
+        self.save_credentials_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(ssh_inner_frame, text="Save Credentials", 
+                      variable=self.save_credentials_var,
+                      bg='#f0f0f0').pack(side=tk.LEFT, padx=10)
+        
+        # Load saved credentials if available
+        self.load_ssh_credentials()
+        
         self.selected_file = None
         self.refresh_local_ip()
 
@@ -470,6 +438,7 @@ class FileTransferApp:
     def on_ip_selected(self, event=None):
         """Handle IP selection change"""
         self.update_destinations()
+        self.load_ssh_credentials()
 
     def add_destination(self):
         """Add a new destination for the current IP"""
@@ -593,11 +562,34 @@ class FileTransferApp:
             text=f"{progress:.1f}% ({stats.get_progress_str()})")
         
         # Update speed and ETA
+        retry_text = f" - Retry {stats.retries}/{MAX_RETRIES}" if stats.retries > 0 else ""
         self.speed_label.config(
-            text=f"{stats.get_speed_str()} - {stats.get_eta_str()}")
+            text=f"{stats.get_speed_str()} - {stats.get_eta_str()}{retry_text}")
         
         # Update the window to ensure progress is shown
         self.master.update()
+
+    def load_ssh_credentials(self):
+        """Load saved SSH credentials for the current IP"""
+        ip = self.ip_var.get()
+        if ip:
+            creds = self.ssh_manager.get_credentials(ip)
+            if creds:
+                self.ssh_username.delete(0, tk.END)
+                self.ssh_username.insert(0, creds.get("username", ""))
+                self.ssh_password.delete(0, tk.END)
+                self.ssh_password.insert(0, creds.get("password", ""))
+
+    def save_ssh_credentials(self):
+        """Save current SSH credentials"""
+        if self.save_credentials_var.get():
+            ip = self.ip_var.get()
+            if ip:
+                self.ssh_manager.set_credentials(
+                    ip,
+                    self.ssh_username.get(),
+                    self.ssh_password.get()
+                )
 
     def transfer_file(self):
         """Initiates the file transfer after ensuring a file and connection details are valid."""
@@ -621,6 +613,9 @@ class FileTransferApp:
             messagebox.showerror("Error", "Please select or enter a destination directory.")
             return
         
+        # Save SSH credentials if provided
+        self.save_ssh_credentials()
+        
         try:
             # Update history
             if target_ip not in self.history:
@@ -634,8 +629,9 @@ class FileTransferApp:
             # Start transfer in a separate thread
             def transfer_thread():
                 try:
-                    send_file(target_ip, target_port, self.selected_file, dest_dir, 
-                             progress_callback=self.update_progress)
+                    send_file(target_ip, target_port, self.selected_file, dest_dir,
+                             progress_callback=self.update_progress,
+                             ssh_manager=self.ssh_manager)
                     self.master.after(0, lambda: self.status_label.config(
                         text="Status: Transfer completed successfully!"))
                 except Exception as e:
@@ -658,9 +654,21 @@ class FileTransferApp:
         self.master.quit()
         self.master.destroy()
 
-# =============================================================================
-# PART 5: Main Execution
-# =============================================================================
+def get_thunderbolt_ip():
+    """Get the IP address of the Thunderbolt network interface"""
+    try:
+        # Look for interfaces with the Thunderbolt IP prefix (169.254)
+        for iface in socket.if_nameindex():
+            addrs = socket.getaddrinfo(socket.gethostname(), None)
+            for addr in addrs:
+                ip = addr[4][0]
+                if ip.startswith('169.254.'):
+                    return ip
+        return None
+    except Exception as e:
+        print(f"Error getting Thunderbolt IP: {e}")
+        return None
+
 if __name__ == "__main__":
     # Step 1: Check (and auto-install if needed) the Thunderbolt driver.
     if not check_and_install_thunderbolt_driver():
