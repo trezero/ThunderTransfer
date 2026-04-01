@@ -335,7 +335,7 @@ class FileTransferApp:
         
         # Configure window
         master.geometry("800x600")
-        master.configure(bg='#f0f0f0')
+        master.configure(bg='#1e1e1e')  # Dark mode background
         
         # Set up window close handler
         master.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -344,134 +344,166 @@ class FileTransferApp:
         self.load_history()
         
         # Create main container with padding
-        main_container = tk.Frame(master, bg='#f0f0f0')
-        main_container.pack(padx=20, pady=20, fill=tk.BOTH, expand=True)
+        main_container = tk.Frame(master, bg='#1e1e1e', padx=24, pady=24)
+        main_container.pack(fill=tk.BOTH, expand=True)
         
-        # Style configuration
-        title_style = {'bg': '#f0f0f0', 'fg': '#333333', 'font': ('Helvetica', 16, 'bold')}
-        label_style = {'bg': '#f0f0f0', 'fg': '#333333', 'font': ('Helvetica', 10)}
-        button_style = {'bg': '#2196F3', 'fg': 'white', 'font': ('Helvetica', 10, 'bold'),
-                       'relief': tk.FLAT, 'padx': 15, 'pady': 8}
+        # Style configuration for dark mode
+        title_style = {'bg': '#1e1e1e', 'fg': '#ffffff', 'font': ('Inter', 24, 'bold')}
+        label_style = {'bg': '#1e1e1e', 'fg': '#ffffff', 'font': ('Inter', 14)}
+        button_style = {'bg': '#3b82f6', 'fg': 'white', 'font': ('Inter', 14),
+                     'relief': tk.FLAT, 'padx': 16, 'pady': 8, 'cursor': 'hand2'}
+        disabled_button_style = {'bg': '#374151', 'fg': '#9ca3af', 'font': ('Inter', 14),
+                             'relief': tk.FLAT, 'padx': 16, 'pady': 8}
         
-        # Title
-        title_label = tk.Label(main_container, text="ThunderTransfer", **title_style)
-        title_label.pack(pady=(0, 20))
+        # Configure ttk styles
+        style = ttk.Style()
+        style.configure("TCombobox", 
+                     padding=8,
+                     font=('Inter', 14),
+                     background='#374151',
+                     fieldbackground='#374151',
+                     foreground='#ffffff',
+                     selectbackground='#4b5563',
+                     selectforeground='#ffffff')
+        style.configure("Horizontal.TProgressbar", 
+                     background='#3b82f6',
+                     troughcolor='#374151',
+                     bordercolor='#374151',
+                     lightcolor='#3b82f6',
+                     darkcolor='#3b82f6')
         
-        # Connection Frame
-        conn_frame = tk.LabelFrame(main_container, text="Connection Settings", bg='#f0f0f0', fg='#333333')
-        conn_frame.pack(fill=tk.X, pady=(0, 15))
+        # Header with title and refresh button
+        header_frame = tk.Frame(main_container, bg='#1e1e1e')
+        header_frame.pack(fill=tk.X, pady=(0, 16))
         
-        # IP Frame
-        ip_frame = tk.Frame(conn_frame, bg='#f0f0f0')
-        ip_frame.pack(fill=tk.X, padx=10, pady=5)
+        title_label = tk.Label(header_frame, text="ThunderTransfer", **title_style)
+        title_label.pack(side=tk.LEFT)
         
-        tk.Label(ip_frame, text="Local TB IP:", **label_style).pack(side=tk.LEFT, padx=(0, 5))
-        self.local_ip_value = tk.Label(ip_frame, text="Detecting...", **label_style)
-        self.local_ip_value.pack(side=tk.LEFT, padx=5)
+        refresh_button = tk.Button(header_frame, text="⟳ Refresh", 
+                               command=self.refresh_local_ip,
+                               **button_style)
+        refresh_button.pack(side=tk.RIGHT)
         
-        tk.Button(ip_frame, text="Refresh", command=self.refresh_local_ip,
-                 **button_style).pack(side=tk.LEFT, padx=5)
-        tk.Button(ip_frame, text="Update IP", command=self.update_ip,
-                 **button_style).pack(side=tk.LEFT, padx=5)
+        # Connection settings grid
+        conn_frame = tk.Frame(main_container, bg='#1e1e1e')
+        conn_frame.pack(fill=tk.X, pady=(0, 24))
         
-        # Target IP Frame
-        target_frame = tk.Frame(conn_frame, bg='#f0f0f0')
-        target_frame.pack(fill=tk.X, padx=10, pady=5)
+        # Local IP row
+        local_ip_frame = tk.Frame(conn_frame, bg='#1e1e1e')
+        local_ip_frame.pack(fill=tk.X, pady=(0, 16))
         
-        tk.Label(target_frame, text="Target IP:", **label_style).pack(side=tk.LEFT, padx=(0, 5))
+        tk.Label(local_ip_frame, text="Local TB IP:", **label_style).pack(side=tk.LEFT, padx=(0, 8))
+        self.local_ip_value = tk.Label(local_ip_frame, text="Not detected", **label_style)
+        self.local_ip_value.pack(side=tk.LEFT, padx=(0, 8))
         
-        # Combobox for target IP selection
+        update_ip_btn = tk.Button(local_ip_frame, text="Update IP",
+                               command=self.update_ip, **button_style)
+        update_ip_btn.pack(side=tk.LEFT)
+        
+        # Target IP row
+        target_frame = tk.Frame(conn_frame, bg='#1e1e1e')
+        target_frame.pack(fill=tk.X)
+        
+        tk.Label(target_frame, text="Target IP:", **label_style).pack(side=tk.LEFT, padx=(0, 8))
+        
+        # IP combobox
         self.ip_var = tk.StringVar()
-        self.ip_combo = ttk.Combobox(target_frame, textvariable=self.ip_var, font=('Helvetica', 10))
-        self.ip_combo.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+        self.ip_combo = ttk.Combobox(target_frame, textvariable=self.ip_var)
+        self.ip_combo.pack(side=tk.LEFT, padx=(0, 8), expand=True, fill=tk.X)
         self.ip_combo.insert(0, "169.254.")
         self.update_ip_list()
         self.ip_combo.bind('<<ComboboxSelected>>', self.on_ip_selected)
         
-        tk.Label(target_frame, text="Port:", **label_style).pack(side=tk.LEFT, padx=(10, 5))
-        self.port_entry = tk.Entry(target_frame, width=6, font=('Helvetica', 10))
-        self.port_entry.pack(side=tk.LEFT, padx=5)
+        # Port entry with fixed width
+        port_frame = tk.Frame(target_frame, bg='#1e1e1e')
+        port_frame.pack(side=tk.LEFT, padx=(0, 8))
+        self.port_entry = tk.Entry(port_frame, width=6, font=('Inter', 14),
+                                bg='#374151', fg='#ffffff',
+                                insertbackground='#ffffff',  # Cursor color
+                                relief=tk.FLAT)
+        self.port_entry.pack(side=tk.LEFT)
         self.port_entry.insert(0, "5001")
         
-        tk.Button(target_frame, text="Test Connection", command=self.test_connection,
-                 **button_style).pack(side=tk.LEFT, padx=5)
+        test_conn_btn = tk.Button(target_frame, text="Test Connection",
+                               command=self.test_connection, **button_style)
+        test_conn_btn.pack(side=tk.LEFT)
         
-        # Transfer Frame
-        transfer_frame = tk.LabelFrame(main_container, text="Transfer", bg='#f0f0f0', fg='#333333')
-        transfer_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+        # Destination section
+        dest_frame = tk.Frame(main_container, bg='#1e1e1e')
+        dest_frame.pack(fill=tk.X, pady=(0, 24))
         
-        # Destination frame
-        dest_frame = tk.Frame(transfer_frame, bg='#f0f0f0')
-        dest_frame.pack(fill=tk.X, padx=10, pady=5)
+        tk.Label(dest_frame, text="Destination:", **label_style).pack(side=tk.LEFT, padx=(0, 8))
         
-        tk.Label(dest_frame, text="Destination:", **label_style).pack(side=tk.LEFT, padx=(0, 5))
-        
-        # Combobox for destination selection
         self.dest_var = tk.StringVar()
-        self.dest_combo = ttk.Combobox(dest_frame, textvariable=self.dest_var, font=('Helvetica', 10))
-        self.dest_combo.pack(side=tk.LEFT, expand=True, fill=tk.X)
+        self.dest_combo = ttk.Combobox(dest_frame, textvariable=self.dest_var)
+        self.dest_combo.pack(side=tk.LEFT, padx=(0, 8), expand=True, fill=tk.X)
         
-        # Add new destination button
-        tk.Button(dest_frame, text="New", command=self.add_destination,
-                 **button_style).pack(side=tk.LEFT, padx=5)
+        new_dest_btn = tk.Button(dest_frame, text="New",
+                              command=self.add_destination, **button_style)
+        new_dest_btn.pack(side=tk.LEFT)
         
         # Selection info
-        self.selection_label = tk.Label(transfer_frame, text="No file/folder selected", 
-                                     **label_style, wraplength=700)
-        self.selection_label.pack(pady=10, padx=10)
+        self.selection_label = tk.Label(main_container, text="No file/folder selected",
+                                    **label_style, wraplength=700)
+        self.selection_label.pack(pady=(0, 24))
         
-        # Buttons frame
-        buttons_frame = tk.Frame(transfer_frame, bg='#f0f0f0')
-        buttons_frame.pack(pady=10)
+        # Action buttons
+        buttons_frame = tk.Frame(main_container, bg='#1e1e1e')
+        buttons_frame.pack(pady=(0, 24))
         
-        select_button = tk.Button(buttons_frame, text="Select File/Folder", 
+        select_button = tk.Button(buttons_frame, text="Select File/Folder",
                                command=self.select_file, **button_style)
-        select_button.pack(side=tk.LEFT, padx=5)
+        select_button.pack(side=tk.LEFT, padx=8)
         
-        self.transfer_button = tk.Button(buttons_frame, text="Transfer", 
-                                      command=self.transfer_file, **button_style)
-        self.transfer_button.pack(side=tk.LEFT, padx=5)
+        self.transfer_button = tk.Button(buttons_frame, text="Transfer",
+                                     command=self.transfer_file, **button_style)
+        self.transfer_button.pack(side=tk.LEFT, padx=8)
         
         self.stop_button = tk.Button(buttons_frame, text="Stop Transfer",
-                                  command=self.stop_transfer, **button_style,
-                                  state=tk.DISABLED)
-        self.stop_button.pack(side=tk.LEFT, padx=5)
+                                 command=self.stop_transfer,
+                                 **disabled_button_style,
+                                 state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=8)
         
-        # Progress Frame
-        self.progress_frame = tk.Frame(transfer_frame, bg='#f0f0f0')
-        self.progress_frame.pack(fill=tk.X, padx=10, pady=5)
+        # Progress frame
+        self.progress_frame = tk.Frame(main_container, bg='#1e1e1e')
+        self.progress_frame.pack(fill=tk.X, pady=(0, 16))
         
         # Progress bar
         self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(self.progress_frame, 
-                                         variable=self.progress_var,
-                                         maximum=100)
-        self.progress_bar.pack(fill=tk.X, pady=(5, 0))
+        self.progress_bar = ttk.Progressbar(self.progress_frame,
+                                        variable=self.progress_var,
+                                        maximum=100,
+                                        style="Horizontal.TProgressbar")
+        self.progress_bar.pack(fill=tk.X, pady=(0, 8))
         
         # Progress labels frame
-        self.progress_labels_frame = tk.Frame(self.progress_frame, bg='#f0f0f0')
-        self.progress_labels_frame.pack(fill=tk.X, pady=(5, 0))
+        self.progress_labels_frame = tk.Frame(self.progress_frame, bg='#1e1e1e')
+        self.progress_labels_frame.pack(fill=tk.X)
         
-        # Progress details (left side)
-        self.progress_label = tk.Label(self.progress_labels_frame, 
-                                    text="", 
-                                    bg='#f0f0f0', 
-                                    font=('Helvetica', 9))
+        # Progress details
+        self.progress_label = tk.Label(self.progress_labels_frame,
+                                   text="",
+                                   bg='#1e1e1e',
+                                   fg='#ffffff',
+                                   font=('Inter', 12))
         self.progress_label.pack(side=tk.LEFT)
         
-        # Speed and ETA (right side)
-        self.speed_label = tk.Label(self.progress_labels_frame, 
-                                 text="", 
-                                 bg='#f0f0f0', 
-                                 font=('Helvetica', 9))
+        # Speed and ETA
+        self.speed_label = tk.Label(self.progress_labels_frame,
+                                text="",
+                                bg='#1e1e1e',
+                                fg='#ffffff',
+                                font=('Inter', 12))
         self.speed_label.pack(side=tk.RIGHT)
         
         # Initially hide progress elements
         self.hide_progress()
         
-        # Status
-        self.status_label = tk.Label(main_container, text="Status: Ready", **label_style)
-        self.status_label.pack(pady=5)
+        # Status bar
+        self.status_label = tk.Label(main_container, text="Status: Ready",
+                                 font=('Inter', 14), bg='#1e1e1e', fg='#ffffff')
+        self.status_label.pack()
         
         self.selected_file = None
         self.current_transfer = None  # Keep track of current transfer stats
@@ -632,8 +664,8 @@ class FileTransferApp:
         
     def show_progress(self):
         """Show progress bar and labels"""
-        self.progress_bar.pack(fill=tk.X, pady=(5, 0))
-        self.progress_labels_frame.pack(fill=tk.X, pady=(5, 0))
+        self.progress_bar.pack(fill=tk.X, pady=(0, 8))
+        self.progress_labels_frame.pack(fill=tk.X, pady=(0, 8))
         
     def update_progress(self, stats):
         """Update progress bar and labels with transfer statistics"""
