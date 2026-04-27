@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.claude/
 
 # C extensions
 *.so
@@ -169,3 +170,12 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+# Archon
+.claude/plugins/
+.claude/skills/
+.claude/archon-config.json
+.claude/archon-state.json
+.claude/archon-memory-buffer.jsonl
+.claude/settings.local.json
+.mcp.json
+.archon/

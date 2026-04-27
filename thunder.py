@@ -7,12 +7,15 @@ import requests
 import tkinter as tk
 from tkinter import filedialog, simpledialog, messagebox, ttk
 import sys
+import platform
 from datetime import datetime
 import time
 import humanize
 import hashlib
 from pathlib import Path
 from datetime import timedelta
+
+PLATFORM = platform.system()  # 'Darwin', 'Windows', 'Linux'
 
 # Constants for the application
 APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".thundertransfer")
@@ -562,30 +565,45 @@ class FileTransferApp:
     def update_ip(self):
         """Allow user to manually update the Thunderbolt IP address"""
         current_ip = self.local_ip_value.cget("text")
-        if current_ip == "Not detected":
+        if current_ip in ("Not detected", "Detecting..."):
             current_ip = "169.254."
-            
-        new_ip = simpledialog.askstring("Update IP", 
-                                      "Enter new Thunderbolt IP address:",
-                                      initialvalue=current_ip)
+
+        new_ip = simpledialog.askstring("Update IP",
+                                        "Enter new Thunderbolt IP address:",
+                                        initialvalue=current_ip)
         if new_ip:
             if new_ip.startswith("169.254."):
                 try:
-                    # Attempt to validate IP format
                     socket.inet_aton(new_ip)
-                    # Use netsh to set the IP address (requires admin privileges)
-                    cmd = f'netsh interface ip set address "Thunderbolt" static {new_ip} 255.255.0.0'
-                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                    if result.returncode == 0:
-                        self.local_ip_value.config(text=new_ip)
-                        messagebox.showinfo("Success", "IP address updated successfully")
+                    if PLATFORM == 'Windows':
+                        cmd = f'netsh interface ip set address "Thunderbolt" static {new_ip} 255.255.0.0'
+                        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                        if result.returncode == 0:
+                            self.local_ip_value.config(text=new_ip)
+                            messagebox.showinfo("Success", "IP address updated successfully")
+                        else:
+                            messagebox.showerror("Error",
+                                "Failed to update IP. Make sure you have administrator privileges.")
+                    elif PLATFORM == 'Darwin':
+                        cmd = ['networksetup', '-setmanual', 'Thunderbolt Bridge', new_ip, '255.255.0.0']
+                        result = subprocess.run(cmd, capture_output=True, text=True)
+                        if result.returncode == 0:
+                            self.local_ip_value.config(text=new_ip)
+                            messagebox.showinfo("Success", "IP address updated successfully")
+                        else:
+                            messagebox.showerror("Error",
+                                f"Failed to update IP: {result.stderr.strip()}\n\n"
+                                f"Try manually:\n"
+                                f"  sudo networksetup -setmanual 'Thunderbolt Bridge' {new_ip} 255.255.0.0")
                     else:
-                        messagebox.showerror("Error", 
-                            "Failed to update IP address. Make sure you have administrator privileges.")
+                        messagebox.showinfo("Manual Step Required",
+                            f"On Linux, set the IP manually:\n"
+                            f"  sudo ip addr add {new_ip}/16 dev <thunderbolt-interface>\n\n"
+                            f"Replace <thunderbolt-interface> with the output of: ip link show")
                 except Exception as e:
                     messagebox.showerror("Error", f"Invalid IP address format: {str(e)}")
             else:
-                messagebox.showerror("Error", 
+                messagebox.showerror("Error",
                     "IP address must start with '169.254.' for Thunderbolt network")
 
     def test_connection(self):
@@ -602,13 +620,14 @@ class FileTransferApp:
                 messagebox.showinfo("Success", f"Successfully connected to {target_ip}:{target_port}")
         except Exception as e:
             self.status_label.config(text=f"Status: Connection failed - {str(e)}", fg="red")
-            messagebox.showerror("Connection Error", 
+            messagebox.showerror("Connection Error",
                 f"Could not connect to {target_ip}:{target_port}\n\n"
                 "Please check:\n"
-                "1. Target computer is running this application\n"
-                "2. Thunderbolt connection is established\n"
-                "3. IP address is correct (should start with 169.254.)\n"
-                "4. Port number matches the server")
+                "1. Target computer is running ThunderTransfer (or the receiver script)\n"
+                "2. Thunderbolt cable is connected and the interface is up\n"
+                "3. IP address is correct (link-local, typically 169.254.x.x)\n"
+                "4. Port number matches on both ends\n"
+                "5. Firewall on the target allows inbound connections on this port")
 
     def select_file(self):
         path = filedialog.askdirectory() or filedialog.askopenfilename()
@@ -751,48 +770,67 @@ class FileTransferApp:
         self.master.destroy()
 
 def get_thunderbolt_ip():
-    """Get the IP address of the Thunderbolt network interface"""
+    """Get the link-local IP assigned to the Thunderbolt interface (169.254.x.x)"""
     try:
-        # Look for interfaces with the Thunderbolt IP prefix (169.254)
-        for iface in socket.if_nameindex():
-            addrs = socket.getaddrinfo(socket.gethostname(), None)
-            for addr in addrs:
-                ip = addr[4][0]
-                if ip.startswith('169.254.'):
-                    return ip
+        if PLATFORM == 'Darwin':
+            output = subprocess.check_output(['ifconfig'], text=True, errors='ignore')
+            for line in output.splitlines():
+                line = line.strip()
+                if line.startswith('inet 169.254.'):
+                    return line.split()[1]
+        elif PLATFORM == 'Windows':
+            output = subprocess.check_output(['ipconfig'], text=True, errors='ignore')
+            for line in output.splitlines():
+                if '169.254.' in line and ('IPv4' in line or 'IP Address' in line):
+                    parts = line.split(':')
+                    if len(parts) >= 2:
+                        return parts[-1].strip()
+        elif PLATFORM == 'Linux':
+            output = subprocess.check_output(['ip', 'addr'], text=True, errors='ignore')
+            for line in output.splitlines():
+                line = line.strip()
+                if line.startswith('inet 169.254.'):
+                    return line.split()[1].split('/')[0]
         return None
     except Exception as e:
         print(f"Error getting Thunderbolt IP: {e}")
         return None
 
 if __name__ == "__main__":
-    # Step 1: Check (and auto-install if needed) the Thunderbolt driver.
-    try:
-        import subprocess
-        output = subprocess.check_output(["driverquery", "/FO", "CSV"], text=True)
-        thunderbolt_drivers = [
-            "Thunderbolt(TM)",
-            "Intel(R) Thunderbolt(TM)",
-            "ThunderboltService",
-            "Thunderbolt Controller"
-        ]
-        if not any(driver in output for driver in thunderbolt_drivers):
-            messagebox.showinfo("Driver Installation Required", 
-                "Thunderbolt driver is not installed. Please install it using one of these methods:\n\n"
-                "1. Recommended: Use Lenovo System Update\n"
-                "   - Download from: support.lenovo.com/solutions/ht003029\n"
-                "   - Run System Update\n"
-                "   - Install 'Intel Thunderbolt Driver'\n\n"
-                "2. Manual Installation:\n"
-                "   - Visit support.lenovo.com\n"
-                "   - Enter your machine type\n"
-                "   - Go to Drivers & Software\n"
-                "   - Find and install 'Intel Thunderbolt Driver'\n\n"
-                "After installation, please restart this application.")
+    # On Windows, verify Thunderbolt drivers are present before continuing.
+    # macOS and Linux have native Thunderbolt/USB-C networking support — no check needed.
+    if PLATFORM == 'Windows':
+        try:
+            output = subprocess.check_output(["driverquery", "/FO", "CSV"], text=True)
+            thunderbolt_drivers = [
+                "Thunderbolt(TM)",
+                "Intel(R) Thunderbolt(TM)",
+                "ThunderboltService",
+                "Thunderbolt Controller"
+            ]
+            if not any(driver in output for driver in thunderbolt_drivers):
+                import tkinter as _tk
+                _root = _tk.Tk()
+                _root.withdraw()
+                messagebox.showinfo("Driver Installation Required",
+                    "Thunderbolt driver is not installed. Please install it using one of these methods:\n\n"
+                    "1. Recommended: Use Lenovo System Update\n"
+                    "   - Download from: support.lenovo.com/solutions/ht003029\n"
+                    "   - Run System Update\n"
+                    "   - Install 'Intel Thunderbolt Driver'\n\n"
+                    "2. Manual Installation:\n"
+                    "   - Visit support.lenovo.com\n"
+                    "   - Enter your machine type\n"
+                    "   - Go to Drivers & Software\n"
+                    "   - Find and install 'Intel Thunderbolt Driver'\n\n"
+                    "After installation, please restart this application.")
+                sys.exit(1)
+        except Exception as e:
+            import tkinter as _tk
+            _root = _tk.Tk()
+            _root.withdraw()
+            messagebox.showerror("Error", f"Failed to check Thunderbolt driver: {str(e)}")
             sys.exit(1)
-    except Exception as e:
-        messagebox.showerror("Error", f"Failed to check Thunderbolt driver: {str(e)}")
-        sys.exit(1)
         
     root = tk.Tk()
     app = FileTransferApp(root)
